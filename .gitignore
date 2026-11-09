@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 临时/备份文件
+*.bak
+*.tmp
+~$*.docx
+~$*.doc
+
+# 系统文件
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 测试输出
+*_公文格式.docx
+*_校对.docx
