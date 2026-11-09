@@ -1,0 +1,450 @@
+# -*- coding: utf-8 -*-
+"""
+公文/文档格式改写脚本（GB/T 9704-2012 + 常见文种分流）—— 零第三方依赖版。
+
+依赖：仅 Python 标准库（docx_lite.py 提供 .docx 读写）。
+若环境恰好有 python-docx，本脚本也不依赖它；.doc 转换走 Word/WPS COM（可选）。
+
+用法：python format_gongwen.py <输入.docx|.doc> [输出.docx] [--mode 类型]
+- mode 可选：auto(默认，自动判断) / gongwen / speech / summary / table
+- 只处理 w:p 段落，遇到 w:tbl 直接跳过（避免表格变形）
+- 输出默认：原文件名_公文格式.docx
+"""
+import sys
+import re
+from pathlib import Path
+
+# 自研零依赖 docx 核心（同目录）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from docx_lite import (
+    Document, set_para_format, set_para_text, strip_para_spaces,
+    set_page_margins, get_content_width_twips, scale_table_widths,
+    add_page_number, cm_to_twips,
+)
+
+# 字体名
+FONT_BIAOTI = "方正小标宋简体"   # 标题
+FONT_FANGSONG = "仿宋_GB2312"    # 正文
+FONT_HEITI = "黑体"              # 一级标题
+FONT_KAITI = "楷体_GB2312"       # 二级标题
+
+# 字体降级映射：标准字体 → 系统自带替代（目标电脑缺字体时用）
+FONT_FALLBACK = {
+    "方正小标宋简体": "华文中宋",   # 标题
+    "仿宋_GB2312": "仿宋",          # 正文
+    "楷体_GB2312": "楷体",          # 二级标题
+}
+
+# 字号（磅）
+SIZE_TITLE = 22.0   # 二号
+SIZE_BODY = 16.0    # 三号
+
+# 行距（固定值，统一 30 磅）
+LINE_PT = 30.0
+
+
+def get_installed_fonts():
+    """读取系统已安装字体列表（Windows 注册表 HKLM + HKCU）。
+    返回集合（含注册表登记名和字体文件名）。失败返回空集。"""
+    try:
+        import winreg
+        fonts = set()
+        paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+        ]
+        for hive, subkey in paths:
+            try:
+                key = winreg.OpenKey(hive, subkey)
+                try:
+                    i = 0
+                    while True:
+                        name, value, _type = winreg.EnumValue(key, i)
+                        clean = re.sub(r'\s*\(.*?\)\s*$', '', name)
+                        clean = re.sub(r'\.(ttf|ttc|otf)$', '', clean, flags=re.IGNORECASE)
+                        fonts.add(clean.strip())
+                        fname = Path(str(value)).stem
+                        fonts.add(fname)
+                        i += 1
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        return fonts
+    except Exception:
+        return set()
+
+
+def font_available(font_name, installed):
+    """判断字体是否可用：精确匹配优先；避免短名字串反向证明长名可用。"""
+    if font_name in installed:
+        return True
+    core = re.sub(r'[_0-9]', '', font_name)
+    if not core:
+        return False
+    for f in installed:
+        fk = re.sub(r'[_0-9]', '', f)
+        if fk == core:
+            if '_' in font_name and '_' not in f and 'GB' not in f:
+                continue
+            return True
+    return False
+
+
+def resolve_fonts():
+    """检测已装字体，返回 (字体映射 dict, 降级说明 dict)。"""
+    installed = get_installed_fonts()
+    font_map = {
+        "title": FONT_BIAOTI,
+        "body": FONT_FANGSONG,
+        "heiti": FONT_HEITI,
+        "kaiti": FONT_KAITI,
+    }
+    fallback_notes = {}
+    for key, std, fallback in [
+        ("title", FONT_BIAOTI, FONT_FALLBACK[FONT_BIAOTI]),
+        ("body", FONT_FANGSONG, FONT_FALLBACK[FONT_FANGSONG]),
+        ("kaiti", FONT_KAITI, FONT_FALLBACK[FONT_KAITI]),
+    ]:
+        if not font_available(std, installed):
+            font_map[key] = fallback
+            fallback_notes[std] = fallback
+    return font_map, fallback_notes
+
+
+def classify(text):
+    """判断段落属于哪类：h1 / h2 / h3 / body。"""
+    if re.match(r'^[一二三四五六七八九十]+、', text):
+        return "h1"
+    if re.match(r'^（[一二三四五六七八九十]+）', text):
+        return "h2"
+    if re.match(r'^\d+[\.、]', text):
+        return "h3"
+    return "body"
+
+
+def is_salutation(text):
+    """判断是否为称谓/主送机关行（顶格、以冒号结尾的短行）。"""
+    t = text.strip()
+    if not t.endswith('：'):
+        return False
+    if len(t) > 40:
+        return False
+    return True
+
+
+def detect_doc_type(text):
+    """识别文种：返回文种名或 None（仅针对正式公文）。"""
+    patterns = [
+        ("通知", ["的通知", "现将有关事项通知如下", "特此通知"]),
+        ("报告", ["的报告", "现将有关情况报告如下", "特此报告", "以上报告"]),
+        ("请示", ["的请示", "妥否，请批示", "请予审批", "请示如下"]),
+        ("函", ["的函", "特此函告", "敬请函复", "函复如下", "特此函商"]),
+        ("纪要", ["会议纪要", "纪要"]),
+        ("决定", ["的决定", "经研究，决定如下", "本决定自"]),
+        ("意见", ["的意见", "现提出如下意见"]),
+        ("通报", ["的通报", "现将有关情况通报如下", "特此通报"]),
+        ("批复", ["的批复", "收悉", "此复", "特此批复"]),
+    ]
+    for name, kws in patterns:
+        for kw in kws:
+            if kw in text:
+                return name
+    return None
+
+
+def detect_category(doc):
+    """判断文件大类：gongwen / speech / summary / table。"""
+    paragraphs = doc.paragraphs()
+    texts = [Document.para_text(p) for p in paragraphs]
+    text_all = "\n".join(texts)
+    n_tables = len(doc.tables())
+    n_nonempty_p = sum(1 for t in texts if t.strip())
+
+    # 标题可能多行（主标题 + 副标题「XX讲话稿」），看前 3 行非空文本
+    head_lines = [t.strip() for t in texts if t.strip()][:3]
+    title_joined = " ".join(head_lines)
+
+    if any(k in title_joined for k in ["讲话", "发言", "致辞", "演讲", "动员", "辅导"]):
+        return "speech"
+    if any(k in title_joined for k in ["总结", "汇报", "体会", "心得", "述职", "情况报告", "自查"]):
+        return "summary"
+    if detect_doc_type(text_all) is not None:
+        return "gongwen"
+    if re.search(r'^[^\n]{0,30}：$', text_all, re.M):
+        return "gongwen"
+    if n_tables >= 1 and n_nonempty_p <= n_tables * 3:
+        return "table"
+    return "summary"
+
+
+def convert_doc_to_docx(src):
+    """把 .doc 转成 .docx（走 Word/WPS COM）。返回 .docx 路径，失败返回 None。"""
+    try:
+        import win32com.client
+        import pythoncom
+        import shutil
+    except ImportError:
+        return None
+    # 中文文件名会触发 WPS 拦截，复制成 ASCII 名
+    tmp_doc = src.with_name("__conv_tmp.doc")
+    tmp_docx = src.with_name("__conv_tmp.docx")
+    shutil.copy2(src, tmp_doc)
+    try:
+        pythoncom.CoInitialize()
+        word = None
+        try:
+            word = win32com.client.DispatchEx("Word.Application")
+            word.DisplayAlerts = 0
+            d = word.Documents.Open(str(tmp_doc), ReadOnly=True)
+            d.SaveAs(str(tmp_docx), FileFormat=12)  # 12 = wdFormatXMLDocument (.docx)
+            d.Close(False)
+            if tmp_docx.exists():
+                return tmp_docx
+        finally:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+    except Exception:
+        return None
+    finally:
+        try:
+            tmp_doc.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print("用法：python format_gongwen.py <输入.docx|.doc> [输出.docx] [--mode auto|gongwen|speech|summary|table]")
+        sys.exit(1)
+
+    mode = "auto"
+    rest = [a for a in args if a != "--mode"]
+    if "--mode" in args:
+        i = args.index("--mode")
+        mode = args[i + 1]
+        rest = [a for a in rest if a != args[i + 1]]
+
+    src = Path(rest[0])
+    dst = Path(rest[1]) if len(rest) >= 2 else None
+
+    if not src.exists():
+        print(f"[错误] 文件不存在：{src}")
+        sys.exit(1)
+
+    # .doc → 先转 .docx（零依赖脚本本身不处理 .doc，走 COM 可选转换）
+    converted_tmp = None
+    if src.suffix.lower() == ".doc":
+        tmp_docx = convert_doc_to_docx(src)
+        if tmp_docx is None:
+            print("[错误] .doc 转 .docx 失败（本机无 Word/WPS 或 COM 不可用）。")
+            print("       请先用 Word/WPS 另存为 .docx 后再处理。")
+            sys.exit(1)
+        converted_tmp = tmp_docx
+        src = tmp_docx
+
+    if dst is None:
+        dst = src.with_name(src.stem + "_公文格式.docx")
+
+    doc = Document(str(src))
+
+    # 判断大类
+    category = detect_category(doc) if mode == "auto" else mode
+    print(f"[类型] {category}")
+
+    # 表格类：不改格式，只输出文本供校对
+    if category == "table":
+        print("[说明] 表格类材料，不修改格式，仅输出内容供校对")
+        print("[正文文本]")
+        for p in doc.paragraphs():
+            t = Document.para_text(p).strip()
+            if t:
+                print(t)
+        print("[表格文本]")
+        for rows in doc.table_texts():
+            for row in rows:
+                print(" | ".join(row))
+        print("[未生成新文件，原文件未改动]")
+        sys.exit(0)
+
+    # 字体检测 + 降级
+    font_map, fallback_notes = resolve_fonts()
+    F_BODY = font_map["body"]
+    F_TITLE = font_map["title"]
+    F_HEITI = font_map["heiti"]
+    F_KAITI = font_map["kaiti"]
+
+    # 按大类定版式参数
+    if category == "gongwen":
+        margin = (3.7, 3.5, 2.8, 2.6)
+    else:  # speech / summary
+        margin = (2.8, 2.8, 2.6, 2.6)
+
+    # 记旧正文宽度
+    old_width = get_content_width_twips(doc)
+
+    # 记录旧页边距描述
+    old_sec_desc = _describe_margins(doc)
+
+    # 改页边距 + 缩放表格
+    set_page_margins(doc, margin[0], margin[1], margin[2], margin[3])
+    new_width = get_content_width_twips(doc)
+
+    if old_width and new_width and doc.tables():
+        n = scale_table_widths(doc, old_width, new_width)
+        if n:
+            print(f"[表格] 已等比例缩放 {n} 个表格的列宽")
+        else:
+            print("[表格] 表格为自动/百分比宽度，无需缩放")
+
+    para_changes = []
+
+    # 标题块识别
+    paragraphs = doc.paragraphs()
+    title_indices = []
+    for i, p in enumerate(paragraphs):
+        t = Document.para_text(p).strip()
+        if not t:
+            continue
+        if len(t) <= 50 and not re.search(r'[。；，！？：]$', t):
+            title_indices.append(i)
+        else:
+            break
+    date_re = re.compile(r'^[（(].*?[)）]$')
+    subtitle_re = re.compile(r'^——')
+
+    # 非空段落序号映射
+    para_no = {}
+    _n = 0
+    for p in paragraphs:
+        if Document.para_text(p).strip():
+            _n += 1
+            para_no[id(p)] = _n
+
+    # 遍历所有顶层段落
+    for p in paragraphs:
+        text = Document.para_text(p).strip()
+        if not text:
+            continue
+        is_title = paragraphs.index(p) in title_indices if p in paragraphs else False
+        # 更稳的标题判断：直接看索引
+        idx = paragraphs.index(p)
+        is_title = idx in title_indices
+        is_date = bool(date_re.match(text))
+        is_subtitle = bool(subtitle_re.match(text))
+
+        _no = para_no.get(id(p), 0)
+
+        if is_title:
+            strip_para_spaces(p)
+            if is_date:
+                set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_KAITI,
+                                size_pt=SIZE_BODY, align="center", line_pt=LINE_PT, indent_chars=0)
+                para_changes.append({"idx": _no, "text": text, "what": "日期行：楷体三号、居中"})
+            elif is_subtitle:
+                set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_KAITI,
+                                size_pt=SIZE_BODY, align="center", line_pt=LINE_PT, indent_chars=0)
+                para_changes.append({"idx": _no, "text": text, "what": "副标题：楷体三号、居中"})
+            elif idx == title_indices[0]:
+                set_para_format(doc, p, font_ea=F_TITLE, font_ascii=F_TITLE,
+                                size_pt=SIZE_TITLE, align="center", line_pt=LINE_PT, indent_chars=0)
+                para_changes.append({"idx": _no, "text": text, "what": "主标题：小标宋二号、居中"})
+            else:
+                set_para_format(doc, p, font_ea=F_TITLE, font_ascii=F_TITLE,
+                                size_pt=SIZE_TITLE, align="center", line_pt=LINE_PT, indent_chars=0)
+                para_changes.append({"idx": _no, "text": text, "what": "标题续行：小标宋二号、居中"})
+        else:
+            if is_salutation(text):
+                strip_para_spaces(p)
+                set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT, indent_chars=0)
+                para_changes.append({"idx": _no, "text": text, "what": "称谓：顶格（不缩进）"})
+                continue
+            kind = classify(text)
+            if kind == "h1":
+                set_para_format(doc, p, font_ea=F_HEITI, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
+                para_changes.append({"idx": _no, "text": text, "what": "一级标题：三号黑体"})
+            elif kind == "h2":
+                set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
+                para_changes.append({"idx": _no, "text": text, "what": "二级标题：三号楷体"})
+            elif kind == "h3":
+                set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, bold=True, align="justify", line_pt=LINE_PT)
+                para_changes.append({"idx": _no, "text": text, "what": "三级标题：三号仿宋加粗"})
+            else:
+                set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
+                para_changes.append({"idx": _no, "text": text, "what": "正文：三号仿宋、首行缩进2字符、行距30磅"})
+
+    # 页码
+    page_added = add_page_number(doc)
+
+    doc.save(str(dst))
+
+    full_text = "\n".join(Document.para_text(p) for p in doc.paragraphs() if Document.para_text(p).strip())
+    doc_type = detect_doc_type(full_text)
+
+    print(f"[完成] 已保存：{dst}")
+    print(f"[类型] {category}")
+    print(f"[文种] {doc_type if doc_type else ('无（' + category + '类）')}")
+    print("[改动摘要]")
+    print(f"页边距：{old_sec_desc} → 上{margin[0]:.2f}/下{margin[1]:.2f}/左{margin[2]:.2f}/右{margin[3]:.2f}cm")
+    if page_added:
+        print("页码：已在页脚居中插入「— 1 —」")
+    else:
+        print("页码：页脚已有内容或未改动")
+    if old_width and new_width and doc.tables():
+        print("表格：已按新页宽等比例缩放列宽")
+    if fallback_notes:
+        print("[字体降级]")
+        for std, fall in fallback_notes.items():
+            print(f"  缺「{std}」→ 已用「{fall}」替代")
+    print("[逐条改动]")
+    for c in para_changes:
+        t = c["text"]
+        if len(t) > 20:
+            t = t[:20] + "…"
+        print(f"第{c['idx']}段 | {t} | {c['what']}")
+    print("[正文文本]")
+    for p in doc.paragraphs():
+        t = Document.para_text(p).strip()
+        if t:
+            print(t)
+
+    # 清理临时转换文件
+    if converted_tmp and converted_tmp.exists():
+        try:
+            converted_tmp.unlink()
+        except Exception:
+            pass
+
+
+def _describe_margins(doc):
+    """读取当前页边距描述（供改动摘要）。"""
+    from docx_lite import _w
+    sp = None
+    for c in doc.body:
+        if c.tag == _w("sectPr"):
+            sp = c
+            break
+    if sp is None:
+        return "未知"
+    from docx_lite import find_child, twips_to_cm
+    pgMar = find_child(sp, "pgMar")
+    if pgMar is None:
+        return "未知"
+    top = twips_to_cm(int(pgMar.get(_w("top"), 0)))
+    bottom = twips_to_cm(int(pgMar.get(_w("bottom"), 0)))
+    left = twips_to_cm(int(pgMar.get(_w("left"), 0)))
+    right = twips_to_cm(int(pgMar.get(_w("right"), 0)))
+    return "上%.2f/下%.2f/左%.2f/右%.2fcm" % (top, bottom, left, right)
+
+
+if __name__ == "__main__":
+    main()
