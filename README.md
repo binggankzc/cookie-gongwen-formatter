@@ -1,109 +1,62 @@
-# 公文格式与校对（cookie-gongwen-formatter）
+# 公文格式与校对
 
-把 Word 文档自动改成**党政机关公文格式（GB/T 9704-2012）**，并主动校对文稿内容（错别字、语病、标点、空格、日期格式等）。
+cookie-gongwen-formatter 是用于 Word 公文排版和文字校对的 Agent 技能，也可作为命令行工具使用。版本 1.1.1，MIT License，作者 cookie。
 
-一个可分享的 **Agent 技能包**（Skill），任何支持 Skill 的 Agent（如 WorkBuddy / Claude / Codex 等）安装后即可调用。同时也可作为独立命令行工具直接使用。
+支持正式公文、讲话稿、总结汇报和表格台账。核心脚本只使用 Python 标准库，建议 Python 3.9+。不需要安装 python-docx。
 
-## 特性
+## 安装和使用
 
-- ✅ **零第三方依赖**：核心脚本只用 Python 标准库（`zipfile` + `xml`），不依赖 python-docx。
-- ✅ **Word / WPS 双适配**：格式改写与校对完全不依赖 Office；`.doc` 转换和页码映射可选走 Word 或 WPS COM，自动探测、优雅降级。
-- ✅ **文种自动分流**：自动识别通知 / 报告 / 请示 / 函 / 纪要 / 决定 / 意见 / 通报 / 批复 / 讲话稿 / 总结 / 台账。
-- ✅ **表格保护**：改页边距时等比例缩放表格宽度，避免一页变两页、横向溢出；表格类材料不碰格式。
-- ✅ **字体降级**：目标电脑缺标准公文字体时自动改用系统自带替代字体（方正小标宋→华文中宋等）。
-- ✅ **主动校对**：小错（半角标点、残留空格、日期格式）自动修，大错（错别字、语病、搭配）列清单待确认。
-- ✅ **精确汇报**：交付报告一张表，位置精确到「第几段 + 第几页第几行」。
+Codex：把整个 `cookie-gongwen-formatter` 文件夹放到 `~/.codex/skills/`，下一轮对话使用。也可把本仓库链接交给 Codex，要求安装。
 
-## 快速开始
+Claude Code：放到适用的 `.claude/skills/` 目录。WorkBuddy：放到 `~/.workbuddy/skills/`。其他支持自定义指令的助手可参考 `INSTRUCTIONS.md`，并确保能访问脚本。
 
-### 作为 Agent 技能包
+安装后说“用公文技能处理这份文件”，附 `.docx` 文件或路径。
 
-不同 Agent 的安装方式：
-
-- **WorkBuddy**：把整个 `cookie-gongwen-formatter` 目录放进 `~/.workbuddy/skills/`。
-- **Claude Code**：放进项目的 `.claude/skills/` 或全局 skills 目录。
-- **OpenAI Codex**：把 `AGENTS.md` 的内容放进项目的 `AGENTS.md`，脚本放 `scripts/` 下。
-- **Gemini / Grok 等**：把 `INSTRUCTIONS.md` 里的「角色指令」整段复制进该 Agent 的系统提示词/自定义指令。
-
-装好后，说「用公文技能处理这份文件」并上传/给出 `.docx` 文件路径即可。
-
-### 作为命令行工具
-
-需要 Python 3.7+（无需安装任何第三方包）：
+## 命令行
 
 ```bash
-# 格式改写（自动判断类型）
-python scripts/format_gongwen.py 输入.docx
+# 只读识别，不生成文件
+python scripts/format_gongwen.py 输入.docx --inspect
 
-# 指定类型：gongwen / speech / summary / table
-python scripts/format_gongwen.py 输入.docx --mode speech
+# 格式处理，另存新文件
+python scripts/format_gongwen.py 输入.docx 输出.docx --mode gongwen
 
-# 校对（小错自动修 + 大错列清单）
-python scripts/proofread.py 输入.docx --fix
+# 其他模式：auto、speech、summary、table
+# table 模式只提取文本，不生成格式版
 
-# 页码映射（可选，需 Word/WPS）
-python scripts/map_pages.py 成品.docx
+# 只读规则检查
+python scripts/proofread.py 输出.docx
+
+# 修复明确的中文标点、空格和有效日期，另存 _校对.docx
+python scripts/proofread.py 输出.docx --fix
+
+# Windows 下可选的页码行号映射
+python scripts/map_pages.py 输出.docx
+
+# 回归测试，使用合成数据
+python -m unittest discover -s tests -v
 ```
 
-## 目录结构
+## 1.1.1 修复
 
-```
-cookie-gongwen-formatter/
-├── SKILL.md                      # 技能说明（WorkBuddy / Claude Code 读取的入口）
-├── AGENTS.md                     # 技能说明（Codex 及 AGENTS.md 规范读取的入口）
-├── INSTRUCTIONS.md               # 万能指令版（Gemini / Grok / 任意 Agent 当提示词用）
-├── README.md                     # 本文件（给人看）
-├── LICENSE                       # MIT
-├── references/
-│   └── gongwen-format.md         # GB/T 9704-2012 详细规范、高频错字表、文种结构
-└── scripts/
-    ├── docx_lite.py              # 零依赖 .docx 读写核心
-    ├── format_gongwen.py         # 格式改写主脚本
-    ├── proofread.py              # 校对脚本
-    └── map_pages.py              # 页码映射（可选增强）
-```
+保护数字序号、小数、英文、网址、邮箱、路径和文件名，避免将“1.”改成“1。”。日期转换验证真实日历日期，跳过技术字符串。保留普通段落的局部强调，复杂段落和表格内文字只提示。
 
-## 多 Agent 兼容（不冲突）
+文种优先依据标题末尾，再看结尾惯用语。“意见建议报告”识别为报告。增加 `--inspect`，避免为了查看类型而先生成文件。
 
-本技能是「多 Agent 通用」包，**核心脚本对所有 Agent 完全通用**（零第三方依赖的纯 Python 标准库代码）。不同 Agent 只是「如何读取说明」的方式不同，所以提供了三个入口文件，各 Agent 各取所需：
+macOS 从字体文件读取真实字体名称；替代字体必须确实存在。清理正文段落继承的缩进和分页设置，移除与指定字体冲突的主题字体引用。保留红色文件头、图形和域段落。
 
-| 你用什么 Agent | 读哪个入口 |
-|---|---|
-| WorkBuddy | `SKILL.md` |
-| Claude Code | `SKILL.md` |
-| OpenAI Codex / AGENTS.md 规范 | `AGENTS.md` |
-| Gemini / Grok / 任意贴提示词即用的助手 | `INSTRUCTIONS.md`（整段当系统提示词复制进去） |
+## 能力范围
 
-三份入口描述的是**同一套流程和脚本**，不会产生冲突。统一的触发句式是「用公文技能处理 <文件>」。
+脚本检查的是预设规则，不能完整判断语法、事实和数据口径；仍需助手结合上下文复核。未命中规则不代表没有错误。
 
-## 可选依赖（仅增强能力）
+版式参数参考 GB/T 9704-2012 和常见材料样式，但自动生成不保证整篇文件完整达标。复杂红头、版记、机关署名、表格及分页需要人工或渲染检查。
 
-| 能力 | 可选依赖 | 没有时的表现 |
-|---|---|---|
-| `.doc` 转 `.docx` | Word / WPS（COM） | 提示用户手动另存为 .docx |
-| 页码/行号映射 | pywin32 + Word/WPS | 降级为「第几段 + 原文」定位 |
+Windows 通过注册表检测字体，macOS 读取已安装字体文件。缺少标准字体时会使用已检测到的替代字体并说明；没有可用中文字体时停止排版。不会自动下载商业字体。
 
-核心的格式改写与校对**永远可用**，与是否安装 Office 无关。
+`.doc` 自动转换和精确页码定位依赖 Windows COM。Mac 上建议直接提供 `.docx`，用段号定位问题。
 
-## 支持的文件类型
+处理原稿会另存输出，不覆盖原稿。脚本未实现联网发送；通过 AI 助手使用时，文档内容的处理范围仍取决于该助手与服务配置。不要将真实文稿、账号配置、凭据或测试输出提交到公开仓库。
 
-- 正式公文（通知/报告/请示/函/纪要/决定/意见/通报/批复）
-- 讲话稿 / 发言 / 致辞
-- 总结 / 汇报 / 体会 / 述职
-- 表格 / 台账（只校对、不改格式）
+## 文件结构
 
-## 字体说明
-
-标准公文字体（方正小标宋简体、仿宋_GB2312、楷体_GB2312）是商业字体，技能不会去下载安装。检测到目标电脑缺失时自动降级：
-
-| 标准字体 | 降级替代 |
-|---|---|
-| 方正小标宋简体 | 华文中宋 |
-| 仿宋_GB2312 | 仿宋 |
-| 楷体_GB2312 | 楷体 |
-
-降级信息会写进改动明细，让用户知道文件在别的电脑上也能正常显示。
-
-## License
-
-MIT
+`SKILL.md` 是完整技能入口；`AGENTS.md` 和 `INSTRUCTIONS.md` 提供其他助手入口。`scripts/` 包含格式、校对、轻量 DOCX 读写及可选页码映射；`references/` 包含版式参考；`tests/` 包含回归测试。
