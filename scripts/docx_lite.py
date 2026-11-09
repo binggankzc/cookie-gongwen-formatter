@@ -196,11 +196,17 @@ class Document:
     # ---- 段落属性 ----
     def pPr(self, p):
         """返回段落的 w:pPr（不存在则创建）。"""
-        return get_or_add_child(p, "pPr")
+        props = get_or_add_child(p, "pPr")
+        p.remove(props)
+        p.insert(0, props)
+        return props
 
     def rPr(self, run):
         """返回 run 的 w:rPr（不存在则创建）。"""
-        return get_or_add_child(run, "rPr")
+        props = get_or_add_child(run, "rPr")
+        run.remove(props)
+        run.insert(0, props)
+        return props
 
     # ---- 保存 ----
     def save(self, path):
@@ -270,10 +276,11 @@ def set_para_format(doc, p, *, font_ea=None, font_ascii=None, size_pt=None,
     # 缩进 ind
     if indent_chars is not None:
         if indent_chars == 0:
-            ind = find_child(pPr, "ind")
-            if ind is not None:
-                ind.attrib.pop(_w("firstLine"), None)
-                ind.attrib.pop(_w("firstLineChars"), None)
+            ind = get_or_add_child(pPr, "ind")
+            ind.set(_w("firstLine"), "0")
+            ind.set(_w("firstLineChars"), "0")
+            ind.attrib.pop(_w("hanging"), None)
+            ind.attrib.pop(_w("hangingChars"), None)
         else:
             ind = get_or_add_child(pPr, "ind")
             ind.set(_w("firstLineChars"), str(indent_chars * 100))
@@ -311,6 +318,8 @@ def set_run_format(doc, run, *, font_ea=None, font_ascii=None, size_pt=None,
             rFonts.set(_w("cs"), font_ascii)
         if font_ea:
             rFonts.set(_w("eastAsia"), font_ea)
+        for key in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme", "csTheme"):
+            rFonts.attrib.pop(_w(key), None)
     if size_pt is not None:
         set_attr(rPr, "sz", "val", pt_to_half(size_pt))
         set_attr(rPr, "szCs", "val", pt_to_half(size_pt))
@@ -323,27 +332,27 @@ def set_run_format(doc, run, *, font_ea=None, font_ascii=None, size_pt=None,
 # 段落文本写操作（改 run 文本）
 # ---------------------------------------------------------------------------
 def set_para_text(p, text):
-    """把段落的文本整体替换为 text（写进第一个 run，清空其余 run 文本）。
-    若段落没有 run，则新建一个 run。"""
+    """按文本差异替换段落文字，不合并原有 run。
+    若段落没有 run，则新建一个 run。保留各文本节点及其 run 格式，避免校对吞掉局部强调。"""
     import xml.etree.ElementTree as ET
-    runs = p.findall(_w("r"))
-    if not runs:
+    from difflib import SequenceMatcher
+    nodes = list(p.iter(_w("t")))
+    if not nodes:
         run = ET.SubElement(p, _w("r"))
-        t = ET.SubElement(run, _w("t"))
-        t.set(XML_SPACE, "preserve")
-        t.text = text
-        return
-    # 写进第一个 run 的第一个 w:t
-    r0 = runs[0]
-    t0 = r0.find(_w("t"))
-    if t0 is None:
-        t0 = ET.SubElement(r0, _w("t"))
-    t0.set(XML_SPACE, "preserve")
-    t0.text = text
-    # 清空其余 run 的文本（保留格式元素）
-    for r in runs[1:]:
-        for t in r.findall(_w("t")):
-            t.text = ""
+        nodes = [ET.SubElement(run, _w("t"))]
+    old = ''.join(node.text or '' for node in nodes)
+    owners = [index for index, node in enumerate(nodes) for _ in (node.text or '')]
+    pieces = [[] for _ in nodes]
+    for kind, a, b, c, d in SequenceMatcher(None, old, text, autojunk=False).get_opcodes():
+        if kind == 'equal':
+            for offset in range(b - a):
+                pieces[owners[a + offset]].append(text[c + offset])
+        elif kind in ('replace', 'insert'):
+            owner = owners[a] if a < len(owners) else (owners[-1] if owners else 0)
+            pieces[owner].append(text[c:d])
+    for node, parts in zip(nodes, pieces):
+        node.set(XML_SPACE, "preserve")
+        node.text = ''.join(parts)
 
 
 def strip_para_spaces(p):

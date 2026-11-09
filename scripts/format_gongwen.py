@@ -12,6 +12,8 @@
 """
 import sys
 import re
+import struct
+from functools import lru_cache
 from pathlib import Path
 
 # 自研零依赖 docx 核心（同目录）
@@ -19,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from docx_lite import (
     Document, set_para_format, set_para_text, strip_para_spaces,
     set_page_margins, get_content_width_twips, scale_table_widths,
-    add_page_number, cm_to_twips,
+    add_page_number, cm_to_twips, _w, find_child,
 )
 
 # 字体名
@@ -43,9 +45,60 @@ SIZE_BODY = 16.0    # 三号
 LINE_PT = 30.0
 
 
+def _font_family_names(path):
+    """Read SFNT/TTC family names using the standard library, including Chinese aliases."""
+    names = set()
+    try:
+        with path.open('rb') as stream:
+            header = stream.read(12)
+            if header[:4] == b'ttcf':
+                count = struct.unpack('>I', header[8:12])[0]
+                if count > 1024:
+                    return names
+                offsets = struct.unpack('>' + 'I' * count, stream.read(4 * count))
+            else:
+                offsets = (0,)
+            for offset in offsets:
+                stream.seek(offset + 4)
+                table_count = struct.unpack('>H', stream.read(2))[0]
+                if table_count > 512:
+                    continue
+                stream.seek(offset + 12)
+                records = [stream.read(16) for _ in range(table_count)]
+                for record in records:
+                    tag, _, start, length = struct.unpack('>4sIII', record)
+                    if tag != b'name' or length > 4 * 1024 * 1024:
+                        continue
+                    stream.seek(start)
+                    data = stream.read(length)
+                    _, count, strings = struct.unpack('>HHH', data[:6])
+                    for index in range(count):
+                        record = data[6 + index * 12:18 + index * 12]
+                        platform, encoding, language, name_id, size, pos = struct.unpack('>HHHHHH', record)
+                        if name_id not in (1, 16):
+                            continue
+                        raw = data[strings + pos:strings + pos + size]
+                        codec = 'utf-16-be' if platform in (0, 3) else 'mac_roman'
+                        name = raw.decode(codec, errors='ignore').strip('\x00 ')
+                        if name:
+                            names.add(name)
+    except (OSError, ValueError, struct.error):
+        pass
+    return names
+
+
+@lru_cache(maxsize=1)
 def get_installed_fonts():
     """读取系统已安装字体列表（Windows 注册表 HKLM + HKCU）。
     返回集合（含注册表登记名和字体文件名）。失败返回空集。"""
+    if sys.platform == "darwin":
+        fonts = set()
+        for directory in (Path('/System/Library/Fonts'), Path('/Library/Fonts'), Path.home() / 'Library/Fonts'):
+            if directory.exists():
+                for path in directory.rglob('*'):
+                    if path.suffix.lower() in ('.ttf', '.otf', '.ttc', '.otc'):
+                        fonts.update(_font_family_names(path))
+        return fonts
     try:
         import winreg
         fonts = set()
@@ -94,21 +147,20 @@ def font_available(font_name, installed):
 def resolve_fonts():
     """检测已装字体，返回 (字体映射 dict, 降级说明 dict)。"""
     installed = get_installed_fonts()
-    font_map = {
-        "title": FONT_BIAOTI,
-        "body": FONT_FANGSONG,
-        "heiti": FONT_HEITI,
-        "kaiti": FONT_KAITI,
+    choices = {
+        'title': (FONT_BIAOTI, '华文中宋', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS'),
+        'body': (FONT_FANGSONG, '仿宋', 'STFangsong', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS'),
+        'heiti': (FONT_HEITI, '黑体-简', 'Heiti SC', 'STHeiti', 'Arial Unicode MS'),
+        'kaiti': (FONT_KAITI, '楷体', 'Kaiti SC', '楷体-简', 'STKaiti', 'Songti SC', '宋体-简', 'Arial Unicode MS'),
     }
-    fallback_notes = {}
-    for key, std, fallback in [
-        ("title", FONT_BIAOTI, FONT_FALLBACK[FONT_BIAOTI]),
-        ("body", FONT_FANGSONG, FONT_FALLBACK[FONT_FANGSONG]),
-        ("kaiti", FONT_KAITI, FONT_FALLBACK[FONT_KAITI]),
-    ]:
-        if not font_available(std, installed):
-            font_map[key] = fallback
-            fallback_notes[std] = fallback
+    font_map, fallback_notes = {}, {}
+    for key, candidates in choices.items():
+        selected = next((font for font in candidates if font_available(font, installed)), None)
+        if selected is None:
+            raise RuntimeError('未检测到可用中文字体，停止格式改写；请安装字体或仅做内容校对。')
+        font_map[key] = selected
+        if selected != candidates[0]:
+            fallback_notes[candidates[0]] = selected
     return font_map, fallback_notes
 
 
@@ -135,6 +187,20 @@ def is_salutation(text):
 
 def detect_doc_type(text):
     """识别文种：返回文种名或 None（仅针对正式公文）。"""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    # The title suffix outranks keywords quoted in the title or body.
+    title = lines[0].rstrip('。！？： ')
+    match = re.search(r'(通知|报告|请示|函|纪要|决定|意见|通报|批复)$', title)
+    if match:
+        return match.group(1)
+    # Without a conclusive title, use the closing formula before body references.
+    ending = '\n'.join(lines[-2:])
+    for kind, pattern in [('请示', r'妥否[，,]请批示|请予审批'), ('报告', r'特此报告|以上报告.*审阅'),
+                          ('通知', r'特此通知'), ('函', r'特此函告|敬请函复'), ('批复', r'此复|特此批复')]:
+        if re.search(pattern, ending):
+            return kind
     patterns = [
         ("通知", ["的通知", "现将有关事项通知如下", "特此通知"]),
         ("报告", ["的报告", "现将有关情况报告如下", "特此报告", "以上报告"]),
@@ -161,6 +227,9 @@ def detect_category(doc):
     n_tables = len(doc.tables())
     n_nonempty_p = sum(1 for t in texts if t.strip())
 
+    if n_tables >= 1 and n_nonempty_p <= n_tables * 3:
+        return "table"
+
     # 标题可能多行（主标题 + 副标题「XX讲话稿」），看前 3 行非空文本
     head_lines = [t.strip() for t in texts if t.strip()][:3]
     title_joined = " ".join(head_lines)
@@ -173,8 +242,6 @@ def detect_category(doc):
         return "gongwen"
     if re.search(r'^[^\n]{0,30}：$', text_all, re.M):
         return "gongwen"
-    if n_tables >= 1 and n_nonempty_p <= n_tables * 3:
-        return "table"
     return "summary"
 
 
@@ -216,6 +283,39 @@ def convert_doc_to_docx(src):
     return None
 
 
+def _protected_paragraph(p):
+    for element in p.iter():
+        if element.tag.rsplit('}', 1)[-1] in ('drawing', 'pict', 'object', 'fldChar', 'instrText', 'fldSimple'):
+            return True
+        if element.tag == _w('color'):
+            value = element.get(_w('val'), '')
+            if re.fullmatch(r'[0-9A-Fa-f]{6}', value):
+                red, green, blue = (int(value[i:i+2], 16) for i in (0, 2, 4))
+                if red > 150 and red > green * 1.4 and red > blue * 1.4:
+                    return True
+    return False
+
+
+def _normalize_layout(doc, p, title=False, kind='body'):
+    """Override inherited paragraph layout without deleting styles or body emphasis."""
+    set_para_format(doc, p, indent_chars=0 if title else 2, space_before=0, space_after=0,
+                    paging={key: '0' for key in ('widowControl', 'keepNext', 'keepLines', 'pageBreakBefore')},
+                    linebreak={'kinsoku': '1', 'overflowPunct': '1', 'wordWrap': '0'})
+    props = doc.pPr(p)
+    ind = find_child(props, 'ind')
+    for name in ('left', 'right', 'leftChars', 'rightChars', 'hanging', 'hangingChars'):
+        if name in ('left', 'right', 'leftChars', 'rightChars'):
+            ind.set(_w(name), '0')
+        else:
+            ind.attrib.pop(_w(name), None)
+    # Explicitly suppress inherited bold, while keeping direct body emphasis.
+    for run in p.iter(_w('r')):
+        rpr = doc.rPr(run)
+        if not title and kind == 'body' and find_child(rpr, 'b') is None:
+            import xml.etree.ElementTree as ET
+            ET.SubElement(rpr, _w('b')).set(_w('val'), '0')
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -223,11 +323,14 @@ def main():
         sys.exit(1)
 
     mode = "auto"
-    rest = [a for a in args if a != "--mode"]
+    inspect_only = "--inspect" in args
+    rest = [a for a in args if a not in ("--mode", "--inspect")]
     if "--mode" in args:
         i = args.index("--mode")
         mode = args[i + 1]
         rest = [a for a in rest if a != args[i + 1]]
+    if mode not in ("auto", "gongwen", "speech", "summary", "table"):
+        raise ValueError('无效的 --mode')
 
     src = Path(rest[0])
     dst = Path(rest[1]) if len(rest) >= 2 else None
@@ -250,11 +353,18 @@ def main():
     if dst is None:
         dst = src.with_name(src.stem + "_公文格式.docx")
 
+    if dst.resolve() == src.resolve():
+        raise ValueError('输出路径不能与原文件相同')
     doc = Document(str(src))
+    original_tables = doc.table_texts()
 
     # 判断大类
     category = detect_category(doc) if mode == "auto" else mode
     print(f"[类型] {category}")
+    if inspect_only:
+        print(f"[文种] {detect_doc_type(doc.full_text()) or '未明确'}")
+        print("[只读检查] 未生成或改写文件")
+        return
 
     # 表格类：不改格式，只输出文本供校对
     if category == "table":
@@ -310,7 +420,10 @@ def main():
         t = Document.para_text(p).strip()
         if not t:
             continue
-        if len(t) <= 50 and not re.search(r'[。；，！？：]$', t):
+        if _protected_paragraph(p):
+            continue
+        if ((not title_indices and len(t) <= 80 and not re.search(r'[。；，！？：.!?:]$', t))
+                or (title_indices and (t.startswith('——') or re.match(r'^[（(]\d{4}年.*[)）]$', t)))):
             title_indices.append(i)
         else:
             break
@@ -338,24 +451,29 @@ def main():
         is_subtitle = bool(subtitle_re.match(text))
 
         _no = para_no.get(id(p), 0)
+        if _protected_paragraph(p):
+            para_changes.append({"idx": _no, "text": text, "what": "红色文件头或图形段落：原样保留"})
+            continue
+        kind = classify(text)
+        _normalize_layout(doc, p, title=is_title, kind=kind)
 
         if is_title:
             strip_para_spaces(p)
             if is_date:
                 set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_KAITI,
-                                size_pt=SIZE_BODY, align="center", line_pt=LINE_PT, indent_chars=0)
+                                size_pt=SIZE_BODY, bold=False, align="center", line_pt=LINE_PT, indent_chars=0)
                 para_changes.append({"idx": _no, "text": text, "what": "日期行：楷体三号、居中"})
             elif is_subtitle:
                 set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_KAITI,
-                                size_pt=SIZE_BODY, align="center", line_pt=LINE_PT, indent_chars=0)
+                                size_pt=SIZE_BODY, bold=False, align="center", line_pt=LINE_PT, indent_chars=0)
                 para_changes.append({"idx": _no, "text": text, "what": "副标题：楷体三号、居中"})
             elif idx == title_indices[0]:
                 set_para_format(doc, p, font_ea=F_TITLE, font_ascii=F_TITLE,
-                                size_pt=SIZE_TITLE, align="center", line_pt=LINE_PT, indent_chars=0)
+                                size_pt=SIZE_TITLE, bold=False, align="center", line_pt=LINE_PT, indent_chars=0)
                 para_changes.append({"idx": _no, "text": text, "what": "主标题：小标宋二号、居中"})
             else:
                 set_para_format(doc, p, font_ea=F_TITLE, font_ascii=F_TITLE,
-                                size_pt=SIZE_TITLE, align="center", line_pt=LINE_PT, indent_chars=0)
+                                size_pt=SIZE_TITLE, bold=False, align="center", line_pt=LINE_PT, indent_chars=0)
                 para_changes.append({"idx": _no, "text": text, "what": "标题续行：小标宋二号、居中"})
         else:
             if is_salutation(text):
@@ -367,11 +485,11 @@ def main():
             kind = classify(text)
             if kind == "h1":
                 set_para_format(doc, p, font_ea=F_HEITI, font_ascii=F_BODY,
-                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
+                                size_pt=SIZE_BODY, bold=False, align="justify", line_pt=LINE_PT)
                 para_changes.append({"idx": _no, "text": text, "what": "一级标题：三号黑体"})
             elif kind == "h2":
                 set_para_format(doc, p, font_ea=F_KAITI, font_ascii=F_BODY,
-                                size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
+                                size_pt=SIZE_BODY, bold=False, align="justify", line_pt=LINE_PT)
                 para_changes.append({"idx": _no, "text": text, "what": "二级标题：三号楷体"})
             elif kind == "h3":
                 set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
@@ -386,6 +504,10 @@ def main():
     page_added = add_page_number(doc)
 
     doc.save(str(dst))
+    # Verify that width changes did not alter row/column content.
+    checked = Document(str(dst))
+    if checked.table_texts() != original_tables:
+        raise RuntimeError('输出表格内容或行列结构校验失败，请勿使用该格式版')
 
     full_text = "\n".join(Document.para_text(p) for p in doc.paragraphs() if Document.para_text(p).strip())
     doc_type = detect_doc_type(full_text)
@@ -402,7 +524,7 @@ def main():
     if old_width and new_width and doc.tables():
         print("表格：已按新页宽等比例缩放列宽")
     if fallback_notes:
-        print("[字体降级]")
+        print("[字体降级] 使用已检测到的替代字体，不代表完整符合标准公文字体要求。")
         for std, fall in fallback_notes.items():
             print(f"  缺「{std}」→ 已用「{fall}」替代")
     print("[逐条改动]")
