@@ -137,6 +137,53 @@ class FontAndLayoutTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 fmt.resolve_fonts()
 
+    def test_linux_fc_list_parsing(self):
+        sample = (
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc: Noto Serif CJK SC,Noto Serif CJK SC Regular:style=Regular\n"
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf: DejaVu Sans:style=Book\n"
+            "not-a-font-line\n"
+            "\n"
+        )
+        fonts = fmt._parse_fc_list_output(sample)
+        self.assertIn('Noto Serif CJK SC', fonts)
+        self.assertIn('DejaVu Sans', fonts)
+        self.assertIn('NotoSerifCJK-Regular', fonts)  # 文件 stem 也应被记录
+        self.assertNotIn('not-a-font-line', fonts)
+
+    def test_linux_font_detection_uses_fc_list(self):
+        sample = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc: Noto Serif CJK SC:style=Regular\n"
+        with patch.object(fmt.sys, 'platform', 'linux'), \
+             patch.object(fmt.subprocess, 'run') as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                ['fc-list'], 0, stdout=sample, stderr='')
+            fmt.get_installed_fonts.cache_clear()
+            try:
+                self.assertIn('Noto Serif CJK SC', fmt.get_installed_fonts())
+            finally:
+                fmt.get_installed_fonts.cache_clear()
+
+    def test_linux_fontconfig_missing_returns_empty(self):
+        # fc-list 不存在时不得崩溃：退回目录扫描，本测试用空扫描代替以免扫盘。
+        with patch.object(fmt.sys, 'platform', 'linux'), \
+             patch.object(fmt.subprocess, 'run', side_effect=FileNotFoundError), \
+             patch.object(fmt, '_fonts_from_font_dirs', return_value=set()):
+            fmt.get_installed_fonts.cache_clear()
+            try:
+                self.assertEqual(fmt.get_installed_fonts(), set())
+            finally:
+                fmt.get_installed_fonts.cache_clear()
+
+    def test_noto_cjk_is_accepted_fallback(self):
+        # 只有 Noto CJK 可用时也应能完成字体解析（Linux 兜底），且仍记降级说明。
+        with patch.object(fmt, 'get_installed_fonts',
+                          return_value={'Noto Serif CJK SC', 'Noto Sans CJK SC'}):
+            fonts, notes = fmt.resolve_fonts()
+            self.assertEqual(fonts['title'], 'Noto Serif CJK SC')
+            self.assertEqual(fonts['body'], 'Noto Serif CJK SC')
+            self.assertEqual(fonts['heiti'], 'Noto Sans CJK SC')
+            self.assertEqual(fonts['kaiti'], 'Noto Serif CJK SC')
+            self.assertEqual(len(notes), 4)
+
     def test_theme_override_and_property_order(self):
         class Doc:
             rPr = core.Document.rPr
@@ -217,6 +264,41 @@ class WorkflowTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(ROOT/'scripts/format_gongwen.py'), str(src), str(src)], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(src.read_bytes(), before)
+
+    def test_footer_content_type_override(self):
+        # 端到端：format_gongwen --mode gongwen 新建页脚后，输出 zip 的
+        # [Content_Types].xml 必须含 footer Override，且 footer 部件与 rels 引用齐全。
+        ct_ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / 'input.docx', Path(tmp) / 'formatted.docx'
+            fixture(src)
+            self.run_script('format_gongwen.py', src, out, '--mode', 'gongwen')
+            with zipfile.ZipFile(out) as z:
+                self.assertIn('word/footer1.xml', z.namelist())
+                self.assertIn('[Content_Types].xml', z.namelist())
+                types = ET.fromstring(z.read('[Content_Types].xml'))
+                overrides = {o.get('PartName'): o.get('ContentType')
+                             for o in types.findall('{%s}Override' % ct_ns)}
+                self.assertEqual(
+                    overrides.get('/word/footer1.xml'),
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml')
+                rels = ET.fromstring(z.read('word/_rels/document.xml.rels'))
+                self.assertTrue(any(r.get('Type', '').endswith('/footer') for r in rels))
+
+    def test_footer_override_is_not_duplicated(self):
+        # 对同一文档重复调用 add_page_number 不得产生重复的 Override 声明。
+        ct_ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'input.docx'
+            fixture(src)
+            doc = core.Document(str(src))
+            self.assertTrue(core.add_page_number(doc))
+            self.assertFalse(core.add_page_number(doc))  # 已有内容，第二次应跳过
+            doc.save(str(src))
+            with zipfile.ZipFile(src) as z:
+                types = ET.fromstring(z.read('[Content_Types].xml'))
+                parts = [o.get('PartName') for o in types.findall('{%s}Override' % ct_ns)]
+                self.assertEqual(parts.count('/word/footer1.xml'), 1)
 
 
 if __name__ == '__main__':

@@ -573,6 +573,47 @@ def scale_table_widths(doc, old_width, new_width):
 # ---------------------------------------------------------------------------
 # 页脚页码
 # ---------------------------------------------------------------------------
+CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+FOOTER_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
+
+
+def _ensure_content_type_override(doc, part_name, content_type):
+    """确保 [Content_Types].xml 里有指定部件的 Override 声明（不存在才追加，不重复）。
+
+    OOXML 要求每个部件都在 [Content_Types].xml 里声明；add_page_number()
+    新建 footer 部件时必须补上，否则输出包在严格校验下无效（Word/WPS
+    通常会修复打开，但不应依赖这一点）。
+    若 [Content_Types].xml 缺失，则新建一个最小的 Types 文档。
+    """
+    import xml.etree.ElementTree as ET
+    ct_name = "[Content_Types].xml"
+    part = "/" + part_name.lstrip("/")
+    if ct_name in doc._parts:
+        try:
+            types = ET.fromstring(doc._parts[ct_name])
+        except Exception:
+            return
+    else:
+        types = ET.Element("{%s}Types" % CT_NS)
+        ET.SubElement(types, "{%s}Default" % CT_NS,
+                      {"Extension": "rels",
+                       "ContentType": "application/vnd.openxmlformats-package.relationships+xml"})
+        ET.SubElement(types, "{%s}Default" % CT_NS,
+                      {"Extension": "xml", "ContentType": "application/xml"})
+        ET.SubElement(types, "{%s}Override" % CT_NS,
+                      {"PartName": "/word/document.xml",
+                       "ContentType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"})
+    for override in types.findall("{%s}Override" % CT_NS):
+        if override.get("PartName", "").lstrip("/") == part.lstrip("/"):
+            return  # 已有声明，不重复
+    ET.SubElement(types, "{%s}Override" % CT_NS,
+                  {"PartName": part, "ContentType": content_type})
+    ET.register_namespace("", CT_NS)
+    doc._parts[ct_name] = ET.tostring(types, encoding="utf-8", xml_declaration=True)
+    # 恢复 add_page_number() 用的默认命名空间（relationships），避免影响后续序列化。
+    ET.register_namespace("", "http://schemas.openxmlformats.org/package/2006/relationships")
+
+
 def add_page_number(doc, footer_file="word/footer1.xml", font="宋体", size_pt=14):
     """在页脚居中插入页码「— 1 —」（PAGE 域）。返回是否成功。
 
@@ -616,9 +657,13 @@ def add_page_number(doc, footer_file="word/footer1.xml", font="宋体", size_pt=
                     pass
         return False
 
-    # 已有 footer 关系且部件内容非空 → 跳过（避免覆盖已有页码/版记）
+    # 已有 footer 关系且部件内容非空 → 跳过（避免覆盖已有页码/版记），
+    # 但仍要补上 Content Types 声明（复用的 footer 也可能缺 Override）。
     rel_id, target = _footer_relationship()
     if _footer_has_content(target):
+        if target:
+            part = target if target.startswith("word/") else "word/" + target
+            _ensure_content_type_override(doc, part, FOOTER_CONTENT_TYPE)
         return False
 
     # 确定 footer 部件名与关系 id：
@@ -720,5 +765,8 @@ def add_page_number(doc, footer_file="word/footer1.xml", font="宋体", size_pt=
     # 需要在 sectPr 上声明 r: 命名空间
     rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     ET.register_namespace("r", rns)
+
+    # 新建/复用的 footer 部件必须在 [Content_Types].xml 里声明，否则输出包无效。
+    _ensure_content_type_override(doc, footer_part_name, FOOTER_CONTENT_TYPE)
 
     return True

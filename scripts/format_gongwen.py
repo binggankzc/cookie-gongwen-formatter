@@ -13,6 +13,7 @@
 import sys
 import re
 import struct
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 
@@ -87,10 +88,69 @@ def _font_family_names(path):
     return names
 
 
+def _parse_fc_list_output(text):
+    """解析 `fc-list` 的输出，返回字体家族名集合。
+
+    每行形如：
+        /path/to/font.ttf: Family Name,Family Name Bold:style=Regular
+    冒号后的第二个字段是逗号分隔的家族名；文件 stem 也一并加入
+    （与 Windows 分支同时记录注册表名和文件名的做法一致）。
+    无法解析的行会被跳过，不抛异常。
+    """
+    fonts = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 2:
+            continue
+        path, families = parts[0].strip(), parts[1]
+        for name in families.split(","):
+            name = name.strip()
+            if name:
+                fonts.add(name)
+        stem = Path(path).stem
+        if stem:
+            fonts.add(stem)
+    return fonts
+
+
+def _fonts_from_font_dirs(directories):
+    """fontconfig 不可用时的退路：直接扫描常见字体目录。
+
+    复用 _font_family_names() 读取字体文件的家族名（含中文别名），
+    避免在没有 fc-list 的 Linux 环境上直接返回空集。
+    """
+    fonts = set()
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*"):
+            if path.suffix.lower() in (".ttf", ".otf", ".ttc", ".otc"):
+                fonts.update(_font_family_names(path))
+    return fonts
+
+
 @lru_cache(maxsize=1)
 def get_installed_fonts():
-    """读取系统已安装字体列表（Windows 注册表 HKLM + HKCU）。
-    返回集合（含注册表登记名和字体文件名）。失败返回空集。"""
+    """读取系统已安装字体列表（macOS 扫字体目录；Linux 用 fc-list；Windows 注册表 HKLM + HKCU）。
+    返回集合（含字体家族名和字体文件名）。失败返回空集。"""
+    if sys.platform.startswith("linux"):
+        try:
+            result = subprocess.run(
+                ["fc-list"], capture_output=True, text=True,
+                errors="replace", timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return _parse_fc_list_output(result.stdout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        # fontconfig 不可用或无输出时，退回直接扫描常见字体目录。
+        return _fonts_from_font_dirs((
+            Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
+            Path.home() / ".fonts", Path.home() / ".local/share/fonts",
+        ))
     if sys.platform == "darwin":
         fonts = set()
         for directory in (Path('/System/Library/Fonts'), Path('/Library/Fonts'), Path.home() / 'Library/Fonts'):
@@ -148,10 +208,13 @@ def resolve_fonts():
     """检测已装字体，返回 (字体映射 dict, 降级说明 dict)。"""
     installed = get_installed_fonts()
     choices = {
-        'title': (FONT_BIAOTI, '华文中宋', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS'),
-        'body': (FONT_FANGSONG, '仿宋', 'STFangsong', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS'),
-        'heiti': (FONT_HEITI, '黑体-简', 'Heiti SC', 'STHeiti', 'Arial Unicode MS'),
-        'kaiti': (FONT_KAITI, '楷体', 'Kaiti SC', '楷体-简', 'STKaiti', 'Songti SC', '宋体-简', 'Arial Unicode MS'),
+        # 每组最后一个是 Linux 常见中文字体（Noto CJK）兜底：只有前面
+        # 的标准/常见字体都不存在时才会用到，且仍会记入 fallback_notes 说明。
+        # 若连兜底也没有，下面的循环仍会 raise RuntimeError 停止改写。
+        'title': (FONT_BIAOTI, '华文中宋', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS', 'Noto Serif CJK SC'),
+        'body': (FONT_FANGSONG, '仿宋', 'STFangsong', 'Songti SC', '宋体-简', '宋体', 'Arial Unicode MS', 'Noto Serif CJK SC'),
+        'heiti': (FONT_HEITI, '黑体-简', 'Heiti SC', 'STHeiti', 'Arial Unicode MS', 'Noto Sans CJK SC'),
+        'kaiti': (FONT_KAITI, '楷体', 'Kaiti SC', '楷体-简', 'STKaiti', 'Songti SC', '宋体-简', 'Arial Unicode MS', 'Noto Serif CJK SC'),
     }
     font_map, fallback_notes = {}, {}
     for key, candidates in choices.items():
