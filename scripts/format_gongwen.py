@@ -284,8 +284,14 @@ def convert_doc_to_docx(src):
 
 
 def _protected_paragraph(p):
+    """整段保护的段落：含图形/图片，或红色文件头（红色文字）。
+
+    注意：域代码（fldChar/instrText/fldSimple，如超链接、页码、目录）不整段保护，
+    因为设置字体/字号/缩进/行距这些 run 属性和段落属性不会破坏域结构；
+    含超链接的正文段仍应排版。文本改写（校对）环节才对域代码做保护（见 proofread.py）。
+    """
     for element in p.iter():
-        if element.tag.rsplit('}', 1)[-1] in ('drawing', 'pict', 'object', 'fldChar', 'instrText', 'fldSimple'):
+        if element.tag.rsplit('}', 1)[-1] in ('drawing', 'pict', 'object'):
             return True
         if element.tag == _w('color'):
             value = element.get(_w('val'), '')

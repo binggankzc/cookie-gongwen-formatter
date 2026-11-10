@@ -54,6 +54,97 @@ def _w(tag):
     return "{%s}%s" % (NS["w"], tag)
 
 
+def _extract_namespaces(doc_xml_bytes):
+    """从 document.xml 原始字节提取根元素上声明的所有 xmlns:* 前缀→URI 映射。
+    用正则提取（不依赖解析，因为可能有 ET 无法解析的边界情况）。"""
+    import re
+    text = doc_xml_bytes.decode("utf-8", errors="replace")
+    # 定位根元素标签：从 <w:document（或任意 <X:document）开始到对应的第一个 >
+    m_start = re.search(r"<(\w+):document\b", text)
+    if m_start:
+        i = m_start.start()
+        j = text.find(">", i)
+        root_tag = text[i:j + 1] if j != -1 else text[i:]
+    else:
+        # 兜底：找第一个元素标签（跳过 <?xml ...?> 声明）
+        m = re.search(r"<\w+:", text)
+        if m:
+            i = m.start()
+            j = text.find(">", i)
+            root_tag = text[i:j + 1] if j != -1 else text[i:]
+        else:
+            root_tag = text
+    ns_map = {}
+    for prefix, uri in re.findall(r'xmlns:(\w+)\s*=\s*"([^"]*)"', root_tag):
+        ns_map[prefix] = uri
+    return ns_map
+
+
+def _register_all_namespaces(ns_map):
+    """把提取到的所有命名空间前缀注册到 ElementTree，供序列化时保留。
+    跳过 ET 临时前缀 ns0/ns1/...，避免与标准前缀 w: 等冲突。"""
+    import xml.etree.ElementTree as ET
+    import re
+    for prefix, uri in ns_map.items():
+        if re.match(r'^ns\d+$', prefix):
+            continue
+        try:
+            ET.register_namespace(prefix, uri)
+        except Exception:
+            pass
+
+
+def _restore_root_namespaces(xml_bytes, ns_map):
+    """在序列化后的 document.xml 里，把缺失的 xmlns:* 声明手动补回根元素。
+
+    ElementTree 序列化会丢弃「未被元素/属性实际引用」的前缀声明
+    （如 w14/w15/wp14 只出现在 mc:Ignorable="w14 w15 wp14" 字符串里），
+    导致 mc:Ignorable 引用未声明前缀 → invalid token。这里用字符串方式补回。
+
+    安全规则：
+    - 跳过 ET 临时前缀 ns0/ns1/...（这些是 ElementTree 在未注册时的默认前缀，
+      不应原样保留，否则会与标准前缀 w: 等产生同 URI 重复声明）。
+    - 若某 URI 已被当前根标签里其它前缀声明，则不再重复补（避免 duplicate attribute）。
+    """
+    import re
+    text = xml_bytes.decode("utf-8", errors="replace")
+    # 定位根元素开标签（<w:document ... 到第一个 >）
+    m = re.search(r"<(\w+):document\b[^>]*>", text)
+    if not m:
+        m = re.search(r"<\w+:[^>]*>", text)
+    if not m:
+        return xml_bytes
+    root_open = m.group(0)
+    # 收集当前根标签里已有的前缀和 URI
+    existing_prefixes = set(re.findall(r'xmlns:(\w+)\s*=', root_open))
+    existing_uris = set(re.findall(r'xmlns:\w+\s*=\s*"([^"]*)"', root_open))
+    # 需要补的声明
+    to_add = []
+    for prefix, uri in ns_map.items():
+        # 跳过 ET 临时前缀 ns0/ns1/...
+        if re.match(r'^ns\d+$', prefix):
+            continue
+        if not uri:
+            continue
+        # 前缀已存在，或 URI 已被其它前缀声明，则跳过（避免重复）
+        if prefix in existing_prefixes:
+            continue
+        if uri in existing_uris:
+            continue
+        to_add.append('xmlns:%s="%s"' % (prefix, uri))
+        existing_prefixes.add(prefix)
+        existing_uris.add(uri)
+    # 额外确保 xml 命名空间已声明（xml:space 属性需要）
+    xml_uri = "http://www.w3.org/XML/1998/namespace"
+    if "xml" not in existing_prefixes and xml_uri not in existing_uris:
+        to_add.append('xmlns:xml="%s"' % xml_uri)
+    if not to_add:
+        return xml_bytes
+    # 在根标签的 <...:document 之后、第一个属性之前插入（或追加到 > 之前）
+    new_root = root_open[:-1] + " " + " ".join(to_add) + ">"
+    return text.replace(root_open, new_root, 1).encode("utf-8")
+
+
 # xml:space 属性的正确命名空间（XML 标准命名空间，不是 w 命名空间）
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
@@ -127,6 +218,13 @@ class Document:
             raise DocxError("文件不存在：%s" % self.path)
         self._read()
 
+    def close(self):
+        """释放底层 zip 句柄（读完后应调用，避免 Windows 下文件被锁）。"""
+        try:
+            self._zip.close()
+        except Exception:
+            pass
+
     # ---- 读取 ----
     def _read(self):
         import xml.etree.ElementTree as ET
@@ -142,6 +240,9 @@ class Document:
                 self._parts[n] = data
         if doc_xml is None:
             raise DocxError("不是有效的 docx（缺少 word/document.xml）")
+        # 从原始 XML 提取所有命名空间声明，保存供 save() 时注册/恢复回去，
+        # 避免丢失 w14/w15/wp14/mc/o/v 等前缀（否则 mc:Ignorable 引用未声明前缀导致 invalid token）
+        self._root_ns = _extract_namespaces(doc_xml)
         self._tree = ET.fromstring(doc_xml)
         self.body = self._tree.find(_w("body"))
         if self.body is None:
@@ -212,7 +313,9 @@ class Document:
     def save(self, path):
         """保存文档：document.xml 用改后的树，其余部件原样写回。"""
         import xml.etree.ElementTree as ET
-        # 注册命名空间前缀，保证输出用 w:/r: 等标准前缀，而不是 ns0:/ns1:
+        # 注册命名空间前缀：先注册从原文件提取的全部前缀（保留 w14/w15/mc/o/v 等），
+        # 再补充标准前缀兜底，保证输出用标准前缀而不是 ns0:/ns1:
+        _register_all_namespaces(self._root_ns)
         _register_namespaces()
         dst = Path(path)
         # 用临时文件写，避免覆盖失败
@@ -221,6 +324,10 @@ class Document:
             with zipfile.ZipFile(str(tmp), "w", zipfile.ZIP_DEFLATED) as z:
                 # 先写 document.xml
                 xml_bytes = ET.tostring(self._tree, encoding="utf-8", xml_declaration=True)
+                # 手动补回缺失的命名空间声明（ElementTree 会丢弃「未被元素实际引用」
+                # 的前缀声明，如 w14/w15/wp14 只出现在 mc:Ignorable 字符串里），
+                # 否则 mc:Ignorable="w14 w15 wp14" 引用未声明前缀会报 invalid token。
+                xml_bytes = _restore_root_namespaces(xml_bytes, self._root_ns)
                 z.writestr("word/document.xml", xml_bytes)
                 # 其余部件原样写回
                 for n, data in self._parts.items():
