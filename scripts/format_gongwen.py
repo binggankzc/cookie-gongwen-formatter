@@ -282,8 +282,18 @@ def detect_doc_type(text):
     return None
 
 
-def detect_category(doc):
-    """判断文件大类：gongwen / speech / summary / table。"""
+_SPEECH_KEYWORDS = ["讲话", "发言", "致辞", "演讲", "动员", "辅导"]
+_SUMMARY_KEYWORDS = ["总结", "汇报", "体会", "心得", "述职", "情况报告", "自查"]
+
+
+def detect_category_with_warning(doc):
+    """判断文件大类，返回 (category, warning_or_None)。
+
+    优先级：标题末尾的文种（通知/决定/请示/报告等，见 detect_doc_type）
+    高于标题关键词。关键词（“动员”“汇报”等）只在没有明确文种时
+    才作为启发式依据，且此时置信度低，会返回一条“疑似…，请确认”
+    提示，由调用方打印，而不是静默误判。
+    """
     paragraphs = doc.paragraphs()
     texts = [Document.para_text(p) for p in paragraphs]
     text_all = "\n".join(texts)
@@ -291,21 +301,43 @@ def detect_category(doc):
     n_nonempty_p = sum(1 for t in texts if t.strip())
 
     if n_tables >= 1 and n_nonempty_p <= n_tables * 3:
-        return "table"
+        return "table", None
 
     # 标题可能多行（主标题 + 副标题「XX讲话稿」），看前 3 行非空文本
     head_lines = [t.strip() for t in texts if t.strip()][:3]
     title_joined = " ".join(head_lines)
+    speech_kw = [k for k in _SPEECH_KEYWORDS if k in title_joined]
+    summary_kw = [k for k in _SUMMARY_KEYWORDS if k in title_joined]
 
-    if any(k in title_joined for k in ["讲话", "发言", "致辞", "演讲", "动员", "辅导"]):
-        return "speech"
-    if any(k in title_joined for k in ["总结", "汇报", "体会", "心得", "述职", "情况报告", "自查"]):
-        return "summary"
-    if detect_doc_type(text_all) is not None:
-        return "gongwen"
+    # 1. 标题末尾的文种优先：例如“关于动员部署工作的通知”是通知，
+    #    不是讲话稿；“关于汇报工作的通知”是通知，不是总结。
+    doc_type = detect_doc_type(text_all)
+    if doc_type is not None:
+        if speech_kw or summary_kw:
+            kw = "、".join(speech_kw + summary_kw)
+            return "gongwen", (
+                f"标题含「{kw}」等词，但文种为「{doc_type}」，"
+                "已按正式公文处理，请确认")
+        return "gongwen", None
+
+    # 2. 无明确文种时，才用标题关键词启发式判断，置信度低，需提示。
+    if speech_kw:
+        return "speech", (
+            f"疑似 speech：仅凭标题关键词「{speech_kw[0]}」判断，"
+            "未见明确文种，请确认")
+    if summary_kw:
+        return "summary", (
+            f"疑似 summary：仅凭标题关键词「{summary_kw[0]}」判断，"
+            "未见明确文种，请确认")
     if re.search(r'^[^\n]{0,30}：$', text_all, re.M):
-        return "gongwen"
-    return "summary"
+        return "gongwen", None
+    return "summary", "未识别到明确文种或类型关键词，已按 summary 处理，请确认"
+
+
+def detect_category(doc):
+    """判断文件大类：gongwen / speech / summary / table。"""
+    category, _warning = detect_category_with_warning(doc)
+    return category
 
 
 def convert_doc_to_docx(src):
@@ -346,23 +378,41 @@ def convert_doc_to_docx(src):
     return None
 
 
+def _is_red_color(value):
+    """判断一个 w:color 值是否为红色（红分量高且明显高于绿/蓝）。"""
+    if not re.fullmatch(r'[0-9A-Fa-f]{6}', value or ''):
+        return False
+    red, green, blue = (int(value[i:i+2], 16) for i in (0, 2, 4))
+    return red > 150 and red > green * 1.4 and red > blue * 1.4
+
+
 def _protected_paragraph(p):
-    """整段保护的段落：含图形/图片，或红色文件头（红色文字）。
+    """整段保护的段落：含图形/图片，或红色文字占段落主体。
 
     注意：域代码（fldChar/instrText/fldSimple，如超链接、页码、目录）不整段保护，
     因为设置字体/字号/缩进/行距这些 run 属性和段落属性不会破坏域结构；
     含超链接的正文段仍应排版。文本改写（校对）环节才对域代码做保护（见 proofread.py）。
+
+    红色保护只在红色文字占段落文本一半及以上时才触发：单个红色强调词
+    不应让整段跳过排版；整段都是红色（红头/文件头）时才原样保留。
     """
     for element in p.iter():
         if element.tag.rsplit('}', 1)[-1] in ('drawing', 'pict', 'object'):
             return True
-        if element.tag == _w('color'):
-            value = element.get(_w('val'), '')
-            if re.fullmatch(r'[0-9A-Fa-f]{6}', value):
-                red, green, blue = (int(value[i:i+2], 16) for i in (0, 2, 4))
-                if red > 150 and red > green * 1.4 and red > blue * 1.4:
-                    return True
-    return False
+    total_len = 0
+    red_len = 0
+    for run in p.iter(_w('r')):
+        text = "".join(t.text or "" for t in run.iter(_w('t')))
+        if not text:
+            continue
+        total_len += len(text)
+        rpr = find_child(run, 'rPr')
+        if rpr is None:
+            continue
+        color = find_child(rpr, 'color')
+        if color is not None and _is_red_color(color.get(_w('val'), '')):
+            red_len += len(text)
+    return total_len > 0 and red_len * 2 >= total_len
 
 
 def _normalize_layout(doc, p, title=False, kind='body'):
@@ -385,24 +435,36 @@ def _normalize_layout(doc, p, title=False, kind='body'):
             ET.SubElement(rpr, _w('b')).set(_w('val'), '0')
 
 
-def main():
-    args = sys.argv[1:]
-    if not args:
-        print("用法：python format_gongwen.py <输入.docx|.doc> [输出.docx] [--mode auto|gongwen|speech|summary|table]")
-        sys.exit(1)
+def parse_args(argv):
+    """解析命令行参数（argparse，标准库）。
 
-    mode = "auto"
-    inspect_only = "--inspect" in args
-    rest = [a for a in args if a not in ("--mode", "--inspect")]
-    if "--mode" in args:
-        i = args.index("--mode")
-        mode = args[i + 1]
-        rest = [a for a in rest if a != args[i + 1]]
-    if mode not in ("auto", "gongwen", "speech", "summary", "table"):
-        raise ValueError('无效的 --mode')
+    支持 --mode gongwen 和 --mode=gongwen 两种写法；--mode 缺值、
+    模式非法或出现未知参数时，argparse 直接给出用法并以 exit 2
+    退出，不抛 traceback。"""
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="format_gongwen.py",
+        description="公文/文档格式改写脚本（GB/T 9704-2012 + 常见文种分流）",
+    )
+    parser.add_argument("input", help="输入文件（.docx 或 .doc）")
+    parser.add_argument("output", nargs="?", default=None,
+                        help="输出文件（默认：原文件名_公文格式.docx）")
+    parser.add_argument("--mode", default="auto",
+                        choices=["auto", "gongwen", "speech", "summary", "table"],
+                        help="处理模式（默认 auto，自动判断）")
+    parser.add_argument("--inspect", action="store_true",
+                        help="只读识别，不生成或改写文件")
+    return parser.parse_args(argv)
 
-    src = Path(rest[0])
-    dst = Path(rest[1]) if len(rest) >= 2 else None
+
+def _main_impl():
+    args = parse_args(sys.argv[1:])
+    mode = args.mode
+    inspect_only = args.inspect
+
+    src = Path(args.input)
+    original_src = src
+    dst = Path(args.output) if args.output else None
 
     if not src.exists():
         print(f"[错误] 文件不存在：{src}")
@@ -420,16 +482,24 @@ def main():
         src = tmp_docx
 
     if dst is None:
-        dst = src.with_name(src.stem + "_公文格式.docx")
+        # 默认输出名按原文件（.doc 转来的也按原 .doc 的文件名），
+        # 不能按临时转换文件 __conv_tmp.docx 的 stem。
+        dst = original_src.with_name(original_src.stem + "_公文格式.docx")
 
-    if dst.resolve() == src.resolve():
-        raise ValueError('输出路径不能与原文件相同')
+    if dst.resolve() == original_src.resolve() or dst.resolve() == src.resolve():
+        print("[错误] 输出路径不能与原文件相同")
+        sys.exit(1)
     doc = Document(str(src))
     original_tables = doc.table_texts()
 
-    # 判断大类
-    category = detect_category(doc) if mode == "auto" else mode
+    # 判断大类（auto 时才自动判断；已指定 --mode 时直接用指定值）
+    if mode == "auto":
+        category, category_warning = detect_category_with_warning(doc)
+    else:
+        category, category_warning = mode, None
     print(f"[类型] {category}")
+    if category_warning:
+        print(f"[提示] {category_warning}")
     if inspect_only:
         print(f"[文种] {detect_doc_type(doc.full_text()) or '未明确'}")
         print("[只读检查] 未生成或改写文件")
@@ -614,6 +684,29 @@ def main():
             converted_tmp.unlink()
         except Exception:
             pass
+
+
+def main():
+    """入口：调用 _main_impl，并在任何退出/报错路径上都清理 .doc 转换
+    产生的临时文件 __conv_tmp.docx。
+
+    _main_impl 内部只在成功路径末尾清理；中途 raise / sys.exit 时
+    临时文件会泄漏到原文件目录，这里用 try/finally 兜底。
+    Windows COM 转换本身无法在 Linux 上验证（见 M4，未确认）。"""
+    argv = sys.argv[1:]
+    tmp_path = None
+    for arg in argv:
+        if not arg.startswith("-") and Path(arg).suffix.lower() == ".doc":
+            tmp_path = Path(arg).with_name("__conv_tmp.docx")
+            break
+    try:
+        _main_impl()
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _describe_margins(doc):

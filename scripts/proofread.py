@@ -19,10 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from docx_lite import Document, set_para_text, strip_para_spaces
 
 # ---------- 错别字/用词 大错表（需人工确认，不自动改） ----------
+# 注意：“截止”不在此表里：它是子串匹配会误报（“截止日期”“截止目前”
+# 都是正确用法），见下面的 _jiezhi_problems()，只在接具体日期时才提示。
 TYPO_MAP = [
     ("帐号", "账号", "错别字"),
     ("帐户", "账户", "错别字"),
-    ("截止", None, "用词（接时间应用「截至」）"),
     ("其它", "其他", "用词不规范"),
     ("既使", "即使", "错别字"),
     ("再接再励", "再接再厉", "错别字"),
@@ -49,9 +50,54 @@ GRAMMAR_PATTERNS = [
     (r'涉及到', "语义重复（「涉及」不含「到」，除非特指）"),
     (r'付诸于', "语义重复（「付诸」即含「于」）"),
     (r'目的是为了', "语义重复"),
+]
+
+# “通过…使…” / “经过…使…” 单独处理：只有“使”后面直接跟动词、
+# 确实缺主语时才提示；“通过学习使大家提高了认识”里“大家”就是
+# “使”的主语，不应误报。见 _shi_missing_subject()。
+_SHI_PATTERNS = [
     (r'通过.{0,10}使', "句式杂糅（「通过…使…」缺主语）"),
     (r'经过.{0,10}使', "句式杂糅（「经过…使…」缺主语）"),
 ]
+
+# “使”后直接跟这些动词时，基本可以判定缺主语（无名词主语）。
+_SHI_MISSING_SUBJECT_VERBS = (
+    "提高了", "提高", "取得了", "取得", "实现", "增强", "促进",
+    "导致", "造成", "形成", "达到", "完成", "提升", "改善",
+    "推动", "加强", "扩大", "缩小", "得到", "获得",
+)
+
+
+def _shi_missing_subject(text, match):
+    """判断“通过…使…”是否真的缺主语。
+
+    “使”后直接跟动词（“使提高了效率”）→ 缺主语，提示；
+    “使”后跟名词/代词主语（“使大家提高了认识”）→ 不提示。"""
+    after = text[match.end():].lstrip(" \t，,")
+    if not after:
+        return True
+    return after.startswith(_SHI_MISSING_SUBJECT_VERBS)
+
+
+def _jiezhi_problems(text):
+    """“截止”只在接具体日期/时间时才提示改用“截至”。
+
+    不提示的正确用法：“截止日期”“截止时间”“截止目前”“截止现在”
+    （作名词/时间状语）。提示的用法：“截止2026年11月9日……”
+    “截止到2026年……”“截止本月底……”（本应用“截至”）。"""
+    problems = []
+    for match in re.finditer(r'截止', text):
+        after = text[match.end():]
+        if after.startswith(("日期", "时间", "目前", "现在", "时", "为止")):
+            continue
+        if re.match(
+            r'\s*(?:到|于)?\s*(?:\d{4}年|\d{4}[-./]\d{1,2}|\d{1,2}月\d{1,2}日'
+            r'|本(?:月|年|周|月底)|下(?:月|年|周)|上(?:月|年|周)'
+            r'|今年|去年|明年)',
+            after,
+        ):
+            problems.append("「截止」→ 疑似「截至」（接时间应用「截至」）")
+    return problems
 
 
 def _technical_spans(text):
@@ -113,43 +159,63 @@ def fix_dates(text):
     return result, result != text
 
 
-def check_and_report(text):
-    """检查一段文本，返回 (小错自动修后的文本, 问题清单列表)。"""
-    problems = []
+def check_and_report_detailed(text):
+    """检查一段文本，返回 (小错自动修后的文本, [(severity, 问题), ...])。
+
+    severity 按规则类型分，不按问题文案里的字眼分：
+    major = 错别字/用词/语病（需人工确认，不自动改）；
+    minor = 日期格式/半角标点/首尾空格/标点重复（可自动修或仅提示）。"""
+    problems = []  # list of (severity, message)
     t = text
 
     # --- 大错：错别字/用词 ---
     for wrong, right, kind in TYPO_MAP:
         if wrong in t:
-            problems.append(f"「{wrong}」→ 疑似「{right if right else '截至'}」（{kind}）")
+            problems.append(("major", f"「{wrong}」→ 疑似「{right}」（{kind}）"))
+
+    # --- 大错：“截止”只在接具体日期时提示 ---
+    for prob in _jiezhi_problems(t):
+        problems.append(("major", prob))
 
     # --- 大错：语病 ---
     for pat, desc in GRAMMAR_PATTERNS:
         m = re.search(pat, t)
         if m:
-            problems.append(f"「{m.group(0)}」— {desc}")
+            problems.append(("major", f"「{m.group(0)}」— {desc}"))
 
-    # --- 小错：半角标点 ---
+    # --- 大错：“通过/经过…使…”只在确实缺主语时提示 ---
+    for pat, desc in _SHI_PATTERNS:
+        m = re.search(pat, t)
+        if m and _shi_missing_subject(t, m):
+            problems.append(("major", f"「{m.group(0)}」— {desc}"))
+
     # --- 小错：日期格式 ---
     fixed, changed = fix_dates(t)
     if changed:
-        problems.append("日期格式可自动统一为「年月日」")
+        problems.append(("minor", "日期格式可自动统一为「年月日」"))
         t = fixed
+    # --- 小错：半角标点 ---
     fixed, changed = half_to_full(t)
     if changed:
-        problems.append("中文语境半角标点可自动转全角")
+        problems.append(("minor", "中文语境半角标点可自动转全角"))
         t = fixed
 
     # --- 小错：段首/段尾残留空格 ---
     if t != t.strip(" \t\u3000"):
-        problems.append("段落首尾残留空格（将自动清理）")
+        problems.append(("minor", "段落首尾残留空格（将自动清理）"))
 
-    # --- 标点重复检测 ---
+    # --- 小错：标点重复检测 ---
     for dup in ["。。", "，，", "、、", "；；", "！！", "？？"]:
         if dup in t:
-            problems.append(f"标点重复「{dup}」")
+            problems.append(("minor", f"标点重复「{dup}」"))
 
     return t, problems
+
+
+def check_and_report(text):
+    """检查一段文本，返回 (小错自动修后的文本, 问题清单列表)。"""
+    t, detailed = check_and_report_detailed(text)
+    return t, [msg for _severity, msg in detailed]
 
 
 def main():
@@ -170,7 +236,7 @@ def main():
     doc = Document(str(src))
     paragraphs = doc.paragraphs()
 
-    all_problems = []
+    all_problems = []  # list of (severity, formatted_message)
     small_fixed_count = 0
     para_no = 0
 
@@ -180,9 +246,9 @@ def main():
         if not t.strip():
             continue
         para_no += 1
-        new_t, problems = check_and_report(t)
-        for prob in problems:
-            all_problems.append(f"第{para_no}段「{t.strip()[:20]}…」：{prob}")
+        new_t, detailed = check_and_report_detailed(t)
+        for severity, prob in detailed:
+            all_problems.append((severity, f"第{para_no}段「{t.strip()[:20]}…」：{prob}"))
 
         # Avoid rewriting fields, hyperlinks, drawings or revision markup automatically.
         complex_tags = {"fldChar", "instrText", "fldSimple", "hyperlink", "drawing", "pict", "ins", "del", "tab", "br"}
@@ -195,15 +261,15 @@ def main():
                 small_fixed_count += 1
 
         elif do_fix and complex_para and new_t != t:
-            all_problems.append(f"第{para_no}段：含域、超链接或复杂内容，仅提示，不自动改写")
+            all_problems.append(("major", f"第{para_no}段：含域、超链接或复杂内容，仅提示，不自动改写"))
 
     # Table text is reviewed without changing table structure or cell formatting.
     for table_no, rows in enumerate(doc.table_texts(), 1):
         for row_no, row in enumerate(rows, 1):
             for col_no, text in enumerate(row, 1):
-                _, problems = check_and_report(text)
-                for problem in problems:
-                    all_problems.append(f"表{table_no}行{row_no}列{col_no}：{problem}〔表格仅提示〕")
+                _, detailed = check_and_report_detailed(text)
+                for severity, problem in detailed:
+                    all_problems.append((severity, f"表{table_no}行{row_no}列{col_no}：{problem}〔表格仅提示〕"))
 
     if do_fix:
         dst = src.with_name(src.stem + "_校对.docx")
@@ -213,8 +279,11 @@ def main():
     else:
         dst = src
 
-    big = [x for x in all_problems if "自动" not in x or "不自动" in x or "仅提示" in x]
-    small = [x for x in all_problems if "自动" in x and "不自动" not in x and "仅提示" not in x]
+    # 大错/小错按规则类型分，不按问题文案里的字眼分（旧逻辑按“自动”
+    # 二字分流，会把“标点重复”等小错划进大错）。表格里的日期问题
+    # 同样按规则类型分，即使它只提示不自动修。
+    big = [msg for severity, msg in all_problems if severity == "major"]
+    small = [msg for severity, msg in all_problems if severity == "minor"]
 
     print(f"\n【大错清单（需你确认后修改）】共 {len(big)} 处")
     for x in big:

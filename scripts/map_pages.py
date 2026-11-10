@@ -14,20 +14,14 @@ Word / WPS 双适配：
 """
 import sys
 import shutil
-import subprocess
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def _cleanup_zombie():
-    """清理残留的 WPS/Word 进程，确保 COM 干净启动。"""
-    for proc in ("wps.exe", "wpp.exe", "et.exe", "wpscloudsvr.exe", "winword.exe"):
-        subprocess.run(["taskkill", "/F", "/IM", proc], capture_output=True)
-    time.sleep(1.0)
-
-
+# 注意：这里曾经有一个 _cleanup_zombie()，用 taskkill /F 强杀
+# winword.exe / wps.exe 等进程，全文件没有任何调用点，已删除。
+# 不要恢复它：它一旦被调用会杀掉用户正在用的 Word/WPS。
 def _try_word_progids():
     """返回可用的 Word/WPS COM ProgID 列表（按优先级）。"""
     # WPS 通常兼容 Word.Application，但若机器装了真 Word 优先用 Word

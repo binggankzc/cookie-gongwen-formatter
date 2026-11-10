@@ -13,6 +13,7 @@ ROOT = Path(os.environ.get('COOKIE_SKILL_TEST_ROOT', Path(__file__).resolve().pa
 sys.path.insert(0, str(ROOT / 'scripts'))
 import docx_lite as core
 import format_gongwen as fmt
+import map_pages as maps
 import proofread as proof
 W = core.W
 
@@ -51,6 +52,28 @@ def fixture(path, title='关于开展学习的通知', table=False):
         z.writestr('_rels/.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
 
 
+def make_docx(path, texts, sect=True):
+    """Build a minimal docx with the given paragraph texts.
+
+    sect=True adds a body sectPr (A4, 2.54cm margins); sect=False
+    leaves the document with no sectPr at all (M8 empty-doc case)."""
+    body = ET.Element(W + 'body')
+    for text in texts:
+        p = ET.SubElement(body, W + 'p')
+        r = ET.SubElement(p, W + 'r')
+        ET.SubElement(r, W + 't').text = text
+    if sect:
+        sec = ET.SubElement(body, W + 'sectPr')
+        ET.SubElement(sec, W + 'pgSz', {W + 'w': '11906', W + 'h': '16838'})
+        ET.SubElement(sec, W + 'pgMar', {W + 'top': '1440', W + 'bottom': '1440', W + 'left': '1440', W + 'right': '1440'})
+    doc = ET.Element(W + 'document')
+    doc.append(body)
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('word/document.xml', ET.tostring(doc))
+        z.writestr('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+        z.writestr('_rels/.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+
+
 class ProofreadingTests(unittest.TestCase):
     def test_numbering_and_decimals(self):
         for text in ['1.承揽项目，每项得5分。', '  14.每项得0.5分。', '版本1.2.3，增长3.14%。']:
@@ -76,6 +99,34 @@ class ProofreadingTests(unittest.TestCase):
         result, issues = proof.check_and_report('再接再励')
         self.assertEqual(result, '再接再励')
         self.assertTrue(any('再接再厉' in issue for issue in issues))
+
+    # M5: “截止”只在接具体日期时才提示。
+    def test_jiezhi_not_flagged_for_deadline_noun(self):
+        for text in ['报名截止日期为2026年11月9日。', '截止目前，已完成三项工作。']:
+            _, issues = proof.check_and_report(text)
+            self.assertFalse(any('截至' in i for i in issues), text)
+
+    def test_jiezhi_flagged_for_date(self):
+        _, issues = proof.check_and_report('截止2026年11月9日，已完成三项工作。')
+        self.assertTrue(any('截至' in i for i in issues))
+        _, issues = proof.check_and_report('截止到2026年11月9日，已完成三项工作。')
+        self.assertTrue(any('截至' in i for i in issues))
+
+    # M5: “通过…使…”只在确实缺主语时才提示。
+    def test_tongguo_shi_with_subject_not_flagged(self):
+        _, issues = proof.check_and_report('通过学习使大家提高了认识。')
+        self.assertFalse(any('句式杂糅' in i for i in issues))
+
+    def test_tongguo_shi_missing_subject_flagged(self):
+        _, issues = proof.check_and_report('通过加强管理使提高了效率。')
+        self.assertTrue(any('句式杂糅' in i for i in issues))
+
+    # M5: 大错/小错按规则类型分，不按文案里的“自动”二字分。
+    def test_severity_is_by_rule_type(self):
+        _, detailed = proof.check_and_report_detailed('你好。。')
+        self.assertTrue(any(s == 'minor' and '标点重复' in m for s, m in detailed))
+        _, detailed = proof.check_and_report_detailed('再接再励')
+        self.assertTrue(any(s == 'major' for s, _ in detailed))
 
     def test_preserve_runs_when_replacing_text(self):
         p = ET.Element(W + 'p')
@@ -120,6 +171,30 @@ class ClassificationTests(unittest.TestCase):
 
     def test_closing_formula(self):
         self.assertEqual(fmt.detect_doc_type('年度材料\n情况如下\n以上报告，请审阅。'), '报告')
+
+    def _category_of(self, tmp, title, body="特此通知。"):
+        path = Path(tmp) / "m1.docx"
+        make_docx(path, [title, body])
+        return core.Document(str(path))
+
+    # M1: 标题末尾的文种优先于标题关键词。
+    def test_doc_type_outranks_dongyuan_keyword(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._category_of(tmp, "关于动员部署工作的通知")
+            self.assertEqual(fmt.detect_category(doc), "gongwen")
+
+    def test_doc_type_outranks_huibao_keyword(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._category_of(tmp, "关于汇报工作的通知")
+            self.assertEqual(fmt.detect_category(doc), "gongwen")
+
+    def test_keyword_only_category_warns(self):
+        # 只有关键词、没有明确文种时，仍按关键词判断，但要给出提示。
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = self._category_of(tmp, "动员大会讲话", "同志们：")
+            cat, warning = fmt.detect_category_with_warning(doc)
+            self.assertEqual(cat, "speech")
+            self.assertIn("请确认", warning)
 
 
 class FontAndLayoutTests(unittest.TestCase):
@@ -199,6 +274,56 @@ class FontAndLayoutTests(unittest.TestCase):
     def test_redhead_is_protected(self):
         p = ET.fromstring(f'<w:p xmlns:w="{core.NS["w"]}"><w:r><w:rPr><w:color w:val="FF0000"/></w:rPr><w:t>示例机关文件</w:t></w:r></w:p>')
         self.assertTrue(fmt._protected_paragraph(p))
+
+    # M7: 单个红色词不保护整段；红色占多数时才保护。
+    def _red_para(self, runs):
+        p = ET.Element(W + 'p')
+        for text, red in runs:
+            r = ET.SubElement(p, W + 'r')
+            if red:
+                pr = ET.SubElement(r, W + 'rPr')
+                ET.SubElement(pr, W + 'color', {W + 'val': 'FF0000'})
+            ET.SubElement(r, W + 't').text = text
+        return p
+
+    def test_single_red_word_does_not_protect(self):
+        p = self._red_para([('这是正文段落，其中只有', False), ('重要', True), ('两个字标红，其余都是正常文字。', False)])
+        self.assertFalse(fmt._protected_paragraph(p))
+
+    def test_majority_red_protects(self):
+        p = self._red_para([('示例机关文件', True), ('通知', True), ('。', False)])
+        self.assertTrue(fmt._protected_paragraph(p))
+
+    # M2: 超链接里的 run 也要拿到字体/字号。
+    def test_hyperlink_runs_get_font_and_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'link.docx'
+            fixture(src)
+            doc = core.Document(str(src))
+            p = doc.paragraphs()[0]
+            link = ET.SubElement(p, W + 'hyperlink')
+            r = ET.SubElement(link, W + 'r')
+            ET.SubElement(r, W + 't').text = '链接文字'
+            core.set_para_format(doc, p, font_ea='宋体', font_ascii='宋体', size_pt=16)
+            fonts = r.find(W + 'rPr/' + W + 'rFonts')
+            self.assertIsNotNone(fonts)
+            self.assertEqual(fonts.get(W + 'ascii'), '宋体')
+            self.assertEqual(r.find(W + 'rPr/' + W + 'sz').get(W + 'val'), '32')
+
+    # M3: 按字符数缩进时，清除残留的 firstLine（twips）。
+    def test_indent_chars_clears_first_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'ind.docx'
+            fixture(src)
+            doc = core.Document(str(src))
+            p = doc.paragraphs()[0]
+            pPr = core.get_or_add_child(p, 'pPr')
+            ind = core.get_or_add_child(pPr, 'ind')
+            ind.set(W + 'firstLine', '720')
+            fmt._normalize_layout(doc, p)
+            ind = p.find(W + 'pPr/' + W + 'ind')
+            self.assertNotIn(W + 'firstLine', ind.attrib)
+            self.assertEqual(ind.get(W + 'firstLineChars'), '200')
 
 
 class WorkflowTests(unittest.TestCase):
@@ -299,6 +424,119 @@ class WorkflowTests(unittest.TestCase):
                 types = ET.fromstring(z.read('[Content_Types].xml'))
                 parts = [o.get('PartName') for o in types.findall('{%s}Override' % ct_ns)]
                 self.assertEqual(parts.count('/word/footer1.xml'), 1)
+
+    # M6: argparse 解析 --mode 的两种写法；缺值/未知参数友好报错（exit 2，无 traceback）。
+    def test_mode_equals_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / 'input.docx', Path(tmp) / 'formatted.docx'
+            fixture(src)
+            self.run_script('format_gongwen.py', src, out, '--mode=gongwen')
+            self.assertTrue(out.exists())
+
+    def test_mode_missing_value_is_friendly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'input.docx'
+            fixture(src)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/format_gongwen.py'), str(src), '--mode'],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn('Traceback', result.stderr)
+            self.assertIn('usage', result.stderr.lower())
+
+    def test_unknown_arg_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'input.docx'
+            fixture(src)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/format_gongwen.py'), str(src), '--bogus'],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn('Traceback', result.stderr)
+
+    # L7: dst==src 给友好错误，不抛 ValueError traceback。
+    def test_dst_same_as_src_is_friendly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'input.docx'
+            fixture(src)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/format_gongwen.py'), str(src), str(src)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn('Traceback', result.stderr)
+            self.assertIn('[错误] 输出路径不能与原文件相同', result.stdout)
+
+    # M4: .doc 转换的默认输出名按原 .doc 的 stem，临时文件失败时也要清理。
+    # Windows COM 转换本身无法在 Linux 上验证（未确认），这里用 mock 替代。
+    def _fake_convert(self, tmp):
+        def fake(src):
+            tmp_docx = Path(tmp) / '__conv_tmp.docx'
+            fixture(tmp_docx)
+            return tmp_docx
+        return fake
+
+    def test_doc_conversion_default_output_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / '报告.doc'
+            src.write_bytes(b'')
+            with patch.object(fmt, 'convert_doc_to_docx', side_effect=self._fake_convert(tmp)), \
+                 patch.object(sys, 'argv', ['format_gongwen.py', str(src)]):
+                fmt.main()
+            self.assertTrue((Path(tmp) / '报告_公文格式.docx').exists())
+            self.assertFalse((Path(tmp) / '__conv_tmp.docx').exists())
+            self.assertFalse((Path(tmp) / '__conv_tmp_公文格式.docx').exists())
+
+    def test_doc_conversion_temp_cleaned_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / '报告.doc'
+            src.write_bytes(b'')
+            with patch.object(fmt, 'convert_doc_to_docx', side_effect=self._fake_convert(tmp)), \
+                 patch.object(fmt, 'resolve_fonts', side_effect=RuntimeError('boom')), \
+                 patch.object(sys, 'argv', ['format_gongwen.py', str(src)]):
+                with self.assertRaises(RuntimeError):
+                    fmt.main()
+            self.assertFalse((Path(tmp) / '__conv_tmp.docx').exists())
+            self.assertFalse((Path(tmp) / '报告_公文格式.docx').exists())
+
+    # M8: 多分节文档边距/页脚应用到所有 sectPr；无 sectPr 的空文档也能处理。
+    def test_multi_section_margins_and_footer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'multi.docx'
+            fixture(src)
+            doc = core.Document(str(src))
+            p = doc.paragraphs()[0]
+            pPr = core.get_or_add_child(p, 'pPr')
+            sp2 = ET.SubElement(pPr, W + 'sectPr')
+            ET.SubElement(sp2, W + 'pgSz', {W + 'w': '11906', W + 'h': '16838'})
+            ET.SubElement(sp2, W + 'pgMar', {W + 'top': '1440', W + 'bottom': '1440',
+                                             W + 'left': '1440', W + 'right': '1440'})
+            core.set_page_margins(doc, 3.7, 3.5, 2.8, 2.6)
+            for sp in core._all_sect_prs(doc):
+                self.assertEqual(len(core._all_sect_prs(doc)), 2)
+                self.assertEqual(sp.find(W + 'pgMar').get(W + 'top'), str(core.cm_to_twips(3.7)))
+            self.assertTrue(core.add_page_number(doc))
+            for sp in core._all_sect_prs(doc):
+                self.assertIsNotNone(sp.find(W + 'footerReference'))
+
+    def test_no_section_doc_gets_margins_and_footer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'empty.docx'
+            make_docx(src, ['只有一段文字。'], sect=False)
+            doc = core.Document(str(src))
+            self.assertEqual(core._all_sect_prs(doc), [])
+            core.set_page_margins(doc, 3.7, 3.5, 2.8, 2.6)
+            self.assertEqual(len(core._all_sect_prs(doc)), 1)
+            self.assertEqual(
+                core._all_sect_prs(doc)[0].find(W + 'pgMar').get(W + 'top'),
+                str(core.cm_to_twips(3.7)))
+            self.assertTrue(core.add_page_number(doc))
+            self.assertIsNotNone(core._all_sect_prs(doc)[0].find(W + 'footerReference'))
+            doc.save(str(src))
+            self.assertEqual(core.Document(str(src)).full_text().strip(), '只有一段文字。')
+
+    # L4: map_pages 里不再有 _cleanup_zombie（不强杀 Word/WPS）。
+    def test_cleanup_zombie_is_gone(self):
+        self.assertFalse(hasattr(maps, '_cleanup_zombie'))
 
 
 if __name__ == '__main__':

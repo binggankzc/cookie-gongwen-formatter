@@ -393,6 +393,10 @@ def set_para_format(doc, p, *, font_ea=None, font_ascii=None, size_pt=None,
             ind.set(_w("firstLineChars"), str(indent_chars * 100))
             if size_pt is not None:
                 ind.set(_w("firstLine"), str(pt_to_twips(size_pt) * indent_chars))
+            else:
+                # 只按字符数缩进时，清除继承的 firstLine（twips）：
+                # 两者并存时 Word 的叠加行为未确认，留着等于双重缩进。
+                ind.attrib.pop(_w("firstLine"), None)
 
     # 分页四项
     if paging is not None:
@@ -406,9 +410,11 @@ def set_para_format(doc, p, *, font_ea=None, font_ascii=None, size_pt=None,
             if v is not None:
                 e.set(_w("val"), v)
 
-    # 字体/字号应用到每个 run
+    # 字体/字号应用到每个 run（用 iter 而不是 findall：超链接里的 run
+    # 在 w:hyperlink 下面，findall 拿不到，会漏改字体字号；_normalize_layout
+    # 里清除加粗时用的也是 iter，两处行为应一致）。
     if font_ea or font_ascii or size_pt is not None or bold is not None:
-        for run in p.findall(_w("r")):
+        for run in p.iter(_w("r")):
             set_run_format(doc, run, font_ea=font_ea, font_ascii=font_ascii,
                            size_pt=size_pt, bold=bold)
 
@@ -475,22 +481,32 @@ def strip_para_spaces(p):
 # ---------------------------------------------------------------------------
 # 页面设置
 # ---------------------------------------------------------------------------
-def set_page_margins(doc, top_cm, bottom_cm, left_cm, right_cm,
-                     page_w_cm=21.0, page_h_cm=29.7):
-    """设置页面尺寸与页边距（单位 cm）。应用到所有 sectPr。"""
-    # 找所有 sectPr（可能在 body 尾部，或段落 pPr 里）
+def _all_sect_prs(doc):
+    """返回文档里所有的 sectPr（body 直属 + 段落 pPr 里的，多分节文档用）。"""
     sect_prs = []
-    # body 直属 sectPr
     for c in doc.body:
         if c.tag == _w("sectPr"):
             sect_prs.append(c)
-    # 段落 pPr 里的 sectPr
     for p in doc.paragraphs():
         pPr = find_child(p, "pPr")
         if pPr is not None:
             sp = find_child(pPr, "sectPr")
             if sp is not None:
                 sect_prs.append(sp)
+    return sect_prs
+
+
+def set_page_margins(doc, top_cm, bottom_cm, left_cm, right_cm,
+                     page_w_cm=21.0, page_h_cm=29.7):
+    """设置页面尺寸与页边距（单位 cm）。应用到所有 sectPr。
+
+    无 sectPr 的空文档：新建一个 body 直属 sectPr 再设置，而不是
+    静默无操作（否则调用方会误以为边距已改）。"""
+    # 找所有 sectPr（可能在 body 尾部，或段落 pPr 里）
+    sect_prs = _all_sect_prs(doc)
+    if not sect_prs:
+        import xml.etree.ElementTree as ET
+        sect_prs = [ET.SubElement(doc.body, _w("sectPr"))]
 
     for sp in sect_prs:
         pgSz = get_or_add_child(sp, "pgSz")
@@ -504,29 +520,20 @@ def set_page_margins(doc, top_cm, bottom_cm, left_cm, right_cm,
 
 
 def get_content_width_twips(doc):
-    """返回正文可用宽度（twip）：页宽 − 左右边距。用于表格缩放比例计算。"""
-    sp = None
-    for c in doc.body:
-        if c.tag == _w("sectPr"):
-            sp = c
-            break
-    if sp is None:
-        for p in doc.paragraphs():
-            pPr = find_child(p, "pPr")
-            if pPr is not None:
-                sp = find_child(pPr, "sectPr")
-                if sp is not None:
-                    break
-    if sp is None:
-        return None
-    pgSz = find_child(sp, "pgSz")
-    pgMar = find_child(sp, "pgMar")
-    if pgSz is None or pgMar is None:
-        return None
-    w = int(pgSz.get(_w("w"), 0))
-    left = int(pgMar.get(_w("left"), 0))
-    right = int(pgMar.get(_w("right"), 0))
-    return w - left - right
+    """返回正文可用宽度（twip）：页宽 − 左右边距。用于表格缩放比例计算。
+
+    多分节文档返回第一个带完整 pgSz/pgMar 的分节宽度（各分节宽度
+    不同时，表格缩放仍按首节计算）；无任何有效分节时返回 None。"""
+    for sp in _all_sect_prs(doc):
+        pgSz = find_child(sp, "pgSz")
+        pgMar = find_child(sp, "pgMar")
+        if pgSz is None or pgMar is None:
+            continue
+        w = int(pgSz.get(_w("w"), 0))
+        left = int(pgMar.get(_w("left"), 0))
+        right = int(pgMar.get(_w("right"), 0))
+        return w - left - right
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -751,17 +758,16 @@ def add_page_number(doc, footer_file="word/footer1.xml", font="宋体", size_pt=
         rel.set("Target", footer_part_name.split("/")[-1])
         doc._parts[rels_name] = ET.tostring(rels, encoding="utf-8", xml_declaration=True)
 
-    # 在 sectPr 里引用 footerReference
-    sp = None
-    for c in doc.body:
-        if c.tag == _w("sectPr"):
-            sp = c
-            break
-    if sp is None:
-        return False
-    ref = get_or_add_child(sp, "footerReference")
-    ref.set(_w("type"), "default")
-    ref.set("{%s}id" % NS["r"], new_rel_id)
+    # 在每个 sectPr 里引用 footerReference（多分节文档各分节都要有，
+    # 否则只有第一节有页码）。无 sectPr 的空文档：新建一个 body 直属
+    # sectPr 再引用，而不是静默返回 False（调用方会误以为“页脚已有内容”）。
+    sect_prs = _all_sect_prs(doc)
+    if not sect_prs:
+        sect_prs = [ET.SubElement(doc.body, _w("sectPr"))]
+    for sp in sect_prs:
+        ref = get_or_add_child(sp, "footerReference")
+        ref.set(_w("type"), "default")
+        ref.set("{%s}id" % NS["r"], new_rel_id)
     # 需要在 sectPr 上声明 r: 命名空间
     rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     ET.register_namespace("r", rns)
