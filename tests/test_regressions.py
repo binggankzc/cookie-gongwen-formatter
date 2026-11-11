@@ -196,12 +196,31 @@ class ClassificationTests(unittest.TestCase):
             self.assertEqual(cat, "speech")
             self.assertIn("请确认", warning)
 
+    # L6: 半角括号、中文数字「一百、」、四级标题都要识别；行首以外不误判。
+    def test_half_width_paren_chinese_numeral_is_h2(self):
+        self.assertEqual(fmt.classify('(一)材料准备'), 'h2')
+        self.assertEqual(fmt.classify('（一）材料准备'), 'h2')
+
+    def test_hundred_numeral_is_h1(self):
+        self.assertEqual(fmt.classify('一百、总体要求'), 'h1')
+        self.assertEqual(fmt.classify('一、总体要求'), 'h1')
+
+    def test_level4_paren_arabic_is_h4(self):
+        self.assertEqual(fmt.classify('(1)具体要求如下'), 'h4')
+        self.assertEqual(fmt.classify('（1）具体要求如下'), 'h4')
+
+    def test_paren_number_not_at_line_start_stays_body(self):
+        self.assertEqual(fmt.classify('根据(一)款规定执行。'), 'body')
+        self.assertEqual(fmt.classify('2026年(1)月1日起实施。'), 'body')
+        self.assertEqual(fmt.classify('(2026)年工作要点'), 'body')
+
 
 class FontAndLayoutTests(unittest.TestCase):
     def test_mac_font_name_reader(self):
-        if sys.platform == 'darwin':
-            names = fmt._font_family_names(Path('/Library/Fonts/Arial Unicode.ttf'))
-            self.assertIn('Arial Unicode MS', names)
+        if sys.platform != 'darwin':
+            self.skipTest('只在 macOS 上验证字体名读取，非 macOS 平台跳过')
+        names = fmt._font_family_names(Path('/Library/Fonts/Arial Unicode.ttf'))
+        self.assertIn('Arial Unicode MS', names)
 
     def test_fallback_must_exist(self):
         with patch.object(fmt, 'get_installed_fonts', return_value={'Songti SC', 'Heiti SC'}):
@@ -537,6 +556,62 @@ class WorkflowTests(unittest.TestCase):
     # L4: map_pages 里不再有 _cleanup_zombie（不强杀 Word/WPS）。
     def test_cleanup_zombie_is_gone(self):
         self.assertFalse(hasattr(maps, '_cleanup_zombie'))
+
+    # L1: 500 段长文档跑通，段落文本按顺序完整保留（enumerate 取下标，
+    # 不再用 paragraphs.index(p)）；含大量重复段落时也不错位。
+    def test_long_document_500_paragraphs(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / 'long.docx', Path(tmp) / 'long_out.docx'
+            texts = ['关于开展学习的通知', '各部门：', '一、学习安排'] + [
+                '这是重复的正文段落，用于验证长文档处理。'] * 497
+            make_docx(src, texts)
+            start = time.perf_counter()
+            self.run_script('format_gongwen.py', src, out, '--mode', 'gongwen')
+            elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 30)
+            got = [core.Document.para_text(p) for p in core.Document(str(out)).paragraphs()]
+            self.assertEqual(got, texts)
+
+    # L3: 表格宽度四舍五入后没变就不计数；真改了才计数。
+    def test_scale_counts_only_changed_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'tbl.docx'
+            fixture(src, table=True)
+            doc = core.Document(str(src))
+            tbl = doc.tables()[0]
+            tblPr = core.get_or_add_child(tbl, 'tblPr')
+            tblW = core.find_child(tblPr, 'tblW')
+            tblW.set(W + 'w', '2')
+            grid = core.find_child(tbl, 'tblGrid')
+            for gc in grid.findall(W + 'gridCol'):
+                gc.set(W + 'w', '1')
+            # 比例 1.1：2 -> 2、1 -> 1，四舍五入后都没变，计数应为 0。
+            self.assertEqual(core.scale_table_widths(doc, 1000, 1100), 0)
+            # 比例 2：宽度确实变了，计数应为 1。
+            self.assertEqual(core.scale_table_widths(doc, 1000, 2000), 1)
+
+    # L3: 表格校验失败时，已保存的输出文件要删掉，不留坏文件。
+    def test_table_validation_failure_removes_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / 'input.docx', Path(tmp) / 'formatted.docx'
+            fixture(src, table=True)
+            real_document = fmt.Document
+            calls = {'n': 0}
+
+            def fake_document(path):
+                doc = real_document(path)
+                calls['n'] += 1
+                if calls['n'] >= 2:  # 保存后的回读校验那一次
+                    doc.table_texts = lambda: [['__mismatch__']]
+                return doc
+            fake_document.para_text = real_document.para_text
+
+            with patch.object(fmt, 'Document', fake_document), \
+                 patch.object(sys, 'argv', ['format_gongwen.py', str(src), str(out), '--mode', 'gongwen']):
+                with self.assertRaises(RuntimeError):
+                    fmt.main()
+            self.assertFalse(out.exists())
 
 
 if __name__ == '__main__':

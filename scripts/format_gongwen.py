@@ -227,14 +227,28 @@ def resolve_fonts():
     return font_map, fallback_notes
 
 
+_CN_NUM = "一二三四五六七八九十百千零两"
+
+
 def classify(text):
-    """判断段落属于哪类：h1 / h2 / h3 / body。"""
-    if re.match(r'^[一二三四五六七八九十]+、', text):
+    """判断段落属于哪类：h1 / h2 / h3 / h4 / body。
+
+    层级（GB/T 9704-2012 惯用写法）：
+      h1: 「一、」「一百、」…（中文数字 + 顿号）
+      h2: 「（一）」「(一)」…（全角或半角括号 + 中文数字）
+      h3: 「1.」「2.」…（阿拉伯数字 + 点）
+      h4: 「（1）」「(1)」…（全角或半角括号 + 1-2 位阿拉伯数字）
+    h4 只认 1-2 位数字：行首出现「(2026)」这类年份括号时不误判为标题。
+    括号序号不在行首时（如「根据(一)款规定」）仍是 body。
+    """
+    if re.match(r'^[' + _CN_NUM + r']+、', text):
         return "h1"
-    if re.match(r'^（[一二三四五六七八九十]+）', text):
+    if re.match(r'^[（(][' + _CN_NUM + r']+[)）]', text):
         return "h2"
     if re.match(r'^\d+[\.、]', text):
         return "h3"
+    if re.match(r'^[（(]\d{1,2}[)）]', text):
+        return "h4"
     return "body"
 
 
@@ -577,14 +591,12 @@ def _main_impl():
             _n += 1
             para_no[id(p)] = _n
 
-    # 遍历所有顶层段落
-    for p in paragraphs:
+    # 遍历所有顶层段落（enumerate 一次取下标：原来每段调两次
+    # paragraphs.index(p)，是 O(n²)；index 还会在重复段落上找错位置）。
+    for idx, p in enumerate(paragraphs):
         text = Document.para_text(p).strip()
         if not text:
             continue
-        is_title = paragraphs.index(p) in title_indices if p in paragraphs else False
-        # 更稳的标题判断：直接看索引
-        idx = paragraphs.index(p)
         is_title = idx in title_indices
         is_date = bool(date_re.match(text))
         is_subtitle = bool(subtitle_re.match(text))
@@ -634,6 +646,10 @@ def _main_impl():
                 set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
                                 size_pt=SIZE_BODY, bold=True, align="justify", line_pt=LINE_PT)
                 para_changes.append({"idx": _no, "text": text, "what": "三级标题：三号仿宋加粗"})
+            elif kind == "h4":
+                set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
+                                size_pt=SIZE_BODY, bold=False, align="justify", line_pt=LINE_PT)
+                para_changes.append({"idx": _no, "text": text, "what": "四级标题：三号仿宋"})
             else:
                 set_para_format(doc, p, font_ea=F_BODY, font_ascii=F_BODY,
                                 size_pt=SIZE_BODY, align="justify", line_pt=LINE_PT)
@@ -646,7 +662,12 @@ def _main_impl():
     # Verify that width changes did not alter row/column content.
     checked = Document(str(dst))
     if checked.table_texts() != original_tables:
-        raise RuntimeError('输出表格内容或行列结构校验失败，请勿使用该格式版')
+        # 校验失败：删掉已保存的坏输出文件，别留在磁盘上误导人。
+        try:
+            Path(dst).unlink()
+        except OSError:
+            pass
+        raise RuntimeError('输出表格内容或行列结构校验失败，已删除该格式版，请勿使用')
 
     full_text = "\n".join(Document.para_text(p) for p in doc.paragraphs() if Document.para_text(p).strip())
     doc_type = detect_doc_type(full_text)

@@ -540,7 +540,12 @@ def get_content_width_twips(doc):
 # 表格宽度缩放
 # ---------------------------------------------------------------------------
 def scale_table_widths(doc, old_width, new_width):
-    """等比例缩放所有表格宽度。返回缩放的表格数。"""
+    """等比例缩放所有顶层表格宽度。返回实际改动了宽度的表格数。
+
+    只计真实改动：宽度类型不是 dxa（自动/百分比宽度）、或四舍五入后
+    宽度不变的表不计数。只处理顶层表（doc.tables() 只返回 body 直属
+    w:tbl），嵌套表不缩放——这是有意的范围限制，不在此次改动内扩大。
+    """
     if old_width <= 0 or new_width <= 0:
         return 0
     ratio = new_width / old_width
@@ -549,31 +554,42 @@ def scale_table_widths(doc, old_width, new_width):
     scaled = 0
     for tbl in doc.tables():
         tblPr = get_or_add_child(tbl, "tblPr")
-        # 总宽 tblW
+        changed = False
+
+        def _scale_width_attr(elem, attr, ratio):
+            """按比例改一个宽度属性；值确实变了才返回 True。"""
+            if elem is None:
+                return False
+            w = elem.get(_w(attr))
+            if not w:
+                return False
+            try:
+                new_w = int(round(int(w) * ratio))
+            except ValueError:
+                return False
+            if new_w == int(w):
+                return False
+            elem.set(_w(attr), str(new_w))
+            return True
+
+        # 总宽 tblW（只处理 dxa 类型）
         tblW = find_child(tblPr, "tblW")
-        if tblW is not None:
-            wtype = tblW.get(_w("type"))
-            w = tblW.get(_w("w"))
-            if wtype == "dxa" and w:
-                tblW.set(_w("w"), str(int(round(int(w) * ratio))))
+        if tblW is not None and tblW.get(_w("type")) == "dxa":
+            changed = _scale_width_attr(tblW, "w", ratio) or changed
         # 列宽 tblGrid
         grid = find_child(tbl, "tblGrid")
         if grid is not None:
             for gc in grid.findall(_w("gridCol")):
-                w = gc.get(_w("w"))
-                if w:
-                    gc.set(_w("w"), str(int(round(int(w) * ratio))))
-        # 单元格 tcW
+                changed = _scale_width_attr(gc, "w", ratio) or changed
+        # 单元格 tcW（只处理 dxa 类型）
         for tc in tbl.iter(_w("tc")):
             tcPr = find_child(tc, "tcPr")
             if tcPr is not None:
                 tcW = find_child(tcPr, "tcW")
-                if tcW is not None:
-                    wtype = tcW.get(_w("type"))
-                    w = tcW.get(_w("w"))
-                    if wtype == "dxa" and w:
-                        tcW.set(_w("w"), str(int(round(int(w) * ratio))))
-        scaled += 1
+                if tcW is not None and tcW.get(_w("type")) == "dxa":
+                    changed = _scale_width_attr(tcW, "w", ratio) or changed
+        if changed:
+            scaled += 1
     return scaled
 
 
